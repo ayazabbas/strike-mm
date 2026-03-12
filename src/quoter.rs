@@ -108,39 +108,32 @@ where
                 );
                 bid_ids.push(U256::ZERO);
             } else {
-                match self
-                    .order_book
-                    .placeOrder(
-                        market_id_u256,
-                        0, // Bid
-                        1, // GTC
-                        U256::from(tick),
-                        lots,
-                    )
-                    .send()
-                    .await
-                {
-                    Ok(pending) => match pending.get_receipt().await {
-                        Ok(receipt) => {
-                            let order_id = parse_order_id_from_receipt(&receipt)
-                                .unwrap_or(U256::ZERO);
-                            info!(
-                                market_id,
-                                side = "bid",
-                                tick,
-                                lots = self.config.lots_per_level,
-                                tx = %receipt.transaction_hash,
-                                order_id = %order_id,
-                                "order placed"
-                            );
-                            bid_ids.push(order_id);
-                        }
-                        Err(e) => {
-                            warn!(market_id, tick, err = %e, "bid order receipt failed");
-                        }
-                    },
-                    Err(e) => {
-                        warn!(market_id, tick, err = %e, "bid order send failed");
+                let place_fut = async {
+                    let pending = self.order_book
+                        .placeOrder(market_id_u256, 0, 1, U256::from(tick), lots)
+                        .send().await.map_err(|e| eyre::eyre!("{e}"))?;
+                    pending.get_receipt().await.map_err(|e| eyre::eyre!("{e}"))
+                };
+                match tokio::time::timeout(std::time::Duration::from_secs(15), place_fut).await {
+                    Ok(Ok(receipt)) => {
+                        let order_id = parse_order_id_from_receipt(&receipt)
+                            .unwrap_or(U256::ZERO);
+                        info!(
+                            market_id,
+                            side = "bid",
+                            tick,
+                            lots = self.config.lots_per_level,
+                            tx = %receipt.transaction_hash,
+                            order_id = %order_id,
+                            "order placed"
+                        );
+                        bid_ids.push(order_id);
+                    }
+                    Ok(Err(e)) => {
+                        warn!(market_id, tick, err = %e, "bid order failed");
+                    }
+                    Err(_) => {
+                        warn!(market_id, tick, "bid order timed out after 15s");
                     }
                 }
             }
@@ -169,39 +162,32 @@ where
                 );
                 ask_ids.push(U256::ZERO);
             } else {
-                match self
-                    .order_book
-                    .placeOrder(
-                        market_id_u256,
-                        1, // Ask
-                        1, // GTC
-                        U256::from(tick),
-                        lots,
-                    )
-                    .send()
-                    .await
-                {
-                    Ok(pending) => match pending.get_receipt().await {
-                        Ok(receipt) => {
-                            let order_id = parse_order_id_from_receipt(&receipt)
-                                .unwrap_or(U256::ZERO);
-                            info!(
-                                market_id,
-                                side = "ask",
-                                tick,
-                                lots = self.config.lots_per_level,
-                                tx = %receipt.transaction_hash,
-                                order_id = %order_id,
-                                "order placed"
-                            );
-                            ask_ids.push(order_id);
-                        }
-                        Err(e) => {
-                            warn!(market_id, tick, err = %e, "ask order receipt failed");
-                        }
-                    },
-                    Err(e) => {
-                        warn!(market_id, tick, err = %e, "ask order send failed");
+                let place_fut = async {
+                    let pending = self.order_book
+                        .placeOrder(market_id_u256, 1, 1, U256::from(tick), lots)
+                        .send().await.map_err(|e| eyre::eyre!("{e}"))?;
+                    pending.get_receipt().await.map_err(|e| eyre::eyre!("{e}"))
+                };
+                match tokio::time::timeout(std::time::Duration::from_secs(15), place_fut).await {
+                    Ok(Ok(receipt)) => {
+                        let order_id = parse_order_id_from_receipt(&receipt)
+                            .unwrap_or(U256::ZERO);
+                        info!(
+                            market_id,
+                            side = "ask",
+                            tick,
+                            lots = self.config.lots_per_level,
+                            tx = %receipt.transaction_hash,
+                            order_id = %order_id,
+                            "order placed"
+                        );
+                        ask_ids.push(order_id);
+                    }
+                    Ok(Err(e)) => {
+                        warn!(market_id, tick, err = %e, "ask order failed");
+                    }
+                    Err(_) => {
+                        warn!(market_id, tick, "ask order timed out after 15s");
                     }
                 }
             }
@@ -241,22 +227,24 @@ where
             if self.dry_run {
                 info!(market_id, order_id = %order_id, "[DRY RUN] would cancel order");
             } else {
-                match self.order_book.cancelOrder(*order_id).send().await {
-                    Ok(pending) => match pending.get_receipt().await {
-                        Ok(receipt) => {
-                            info!(
-                                market_id,
-                                order_id = %order_id,
-                                tx = %receipt.transaction_hash,
-                                "order cancelled"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(market_id, order_id = %order_id, err = %e, "cancel receipt failed");
-                        }
-                    },
-                    Err(e) => {
-                        warn!(market_id, order_id = %order_id, err = %e, "cancel send failed");
+                let cancel_fut = async {
+                    let pending = self.order_book.cancelOrder(*order_id).send().await.map_err(|e| eyre::eyre!("{e}"))?;
+                    pending.get_receipt().await.map_err(|e| eyre::eyre!("{e}"))
+                };
+                match tokio::time::timeout(std::time::Duration::from_secs(15), cancel_fut).await {
+                    Ok(Ok(receipt)) => {
+                        info!(
+                            market_id,
+                            order_id = %order_id,
+                            tx = %receipt.transaction_hash,
+                            "order cancelled"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        warn!(market_id, order_id = %order_id, err = %e, "cancel failed (tx error)");
+                    }
+                    Err(_) => {
+                        warn!(market_id, order_id = %order_id, "cancel timed out after 15s — skipping");
                     }
                 }
             }
