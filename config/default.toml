@@ -1,0 +1,33 @@
+[rpc]
+url = "https://data-seed-prebsc-1-s1.bnbchain.org:8545"
+chain_id = 97
+
+[wallet]
+private_key_env = "MM_PRIVATE_KEY"
+
+[contracts]
+order_book = "0xAFeeF2F0DBE473e4C2BC4b5981793F69804CfaD0"
+vault = "0xf7c51CC50F1589082850978BA8E779318299FeC9"
+usdt = "0x4Be5501EDDF6263984614840A13228D0ecbf8430"
+
+[indexer]
+url = "https://app.strike.pm/api"
+poll_interval_secs = 5
+
+[quoting]
+spread_ticks = 6
+lots_per_level = 5
+num_levels = 2
+requote_threshold_ticks = 2
+requote_cooldown_secs = 2
+min_expiry_secs = 30
+
+[risk]
+max_position_per_market = 50
+max_total_exposure = 200
+stale_data_timeout_secs = 10
+
+[volatility]
+method = "fixed"
+fixed_annual_vol = 0.50
+realized_window_mins = 60
