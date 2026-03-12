@@ -4,6 +4,7 @@ use alloy::sol;
 use alloy::sol_types::SolEvent;
 use eyre::{Result, WrapErr};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::{info, warn};
 
@@ -50,6 +51,9 @@ pub struct Quoter<P> {
     /// market_id → active orders
     pub active_orders: HashMap<u64, MarketOrders>,
     pub dry_run: bool,
+    /// Local nonce counter — incremented after each successful send
+    nonce: AtomicU64,
+    nonce_initialized: bool,
 }
 
 impl<P> Quoter<P>
@@ -67,11 +71,28 @@ where
             config,
             active_orders: HashMap::new(),
             dry_run,
+            nonce: AtomicU64::new(0),
+            nonce_initialized: false,
         }
     }
 
+    /// Sync nonce from the chain (call once at startup or after errors).
+    pub async fn sync_nonce(&mut self, address: Address) -> Result<()> {
+        let n = self.order_book.provider().get_transaction_count(address).await
+            .wrap_err("failed to get nonce")?;
+        self.nonce.store(n, Ordering::SeqCst);
+        self.nonce_initialized = true;
+        info!(nonce = n, "nonce synced from chain");
+        Ok(())
+    }
+
+    /// Get next nonce and increment.
+    fn next_nonce(&self) -> u64 {
+        self.nonce.fetch_add(1, Ordering::SeqCst)
+    }
+
     /// Place bid and ask orders for a market at computed ticks.
-    /// Sends all txs sequentially (nonce management) but does NOT wait for receipts.
+    /// Sends all txs sequentially with local nonce management, does NOT wait for receipts.
     /// Order IDs are tracked via the indexer instead.
     pub async fn place_quotes(
         &mut self,
@@ -102,20 +123,21 @@ where
             if self.dry_run {
                 info!(market_id, side = "bid", tick, lots = self.config.lots_per_level, "[DRY RUN] would place order");
             } else {
+                let nonce = self.next_nonce();
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    self.order_book.placeOrder(market_id_u256, 0, 1, U256::from(tick), lots).send(),
+                    self.order_book.placeOrder(market_id_u256, 0, 1, U256::from(tick), lots).nonce(nonce).send(),
                 ).await {
                     Ok(Ok(pending)) => {
                         let tx_hash = *pending.tx_hash();
-                        info!(market_id, side = "bid", tick, lots = self.config.lots_per_level, tx = %tx_hash, "order sent (not waiting for receipt)");
+                        info!(market_id, side = "bid", tick, lots = self.config.lots_per_level, nonce, tx = %tx_hash, "order sent");
                         pending_count += 1;
                     }
                     Ok(Err(e)) => {
-                        warn!(market_id, tick, err = %e, "bid order send failed");
+                        warn!(market_id, tick, nonce, err = %e, "bid order send failed");
                     }
                     Err(_) => {
-                        warn!(market_id, tick, "bid order send timed out after 5s");
+                        warn!(market_id, tick, nonce, "bid order send timed out after 5s");
                     }
                 }
             }
@@ -137,20 +159,21 @@ where
             if self.dry_run {
                 info!(market_id, side = "ask", tick, lots = self.config.lots_per_level, "[DRY RUN] would place order");
             } else {
+                let nonce = self.next_nonce();
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    self.order_book.placeOrder(market_id_u256, 1, 1, U256::from(tick), lots).send(),
+                    self.order_book.placeOrder(market_id_u256, 1, 1, U256::from(tick), lots).nonce(nonce).send(),
                 ).await {
                     Ok(Ok(pending)) => {
                         let tx_hash = *pending.tx_hash();
-                        info!(market_id, side = "ask", tick, lots = self.config.lots_per_level, tx = %tx_hash, "order sent (not waiting for receipt)");
+                        info!(market_id, side = "ask", tick, lots = self.config.lots_per_level, nonce, tx = %tx_hash, "order sent");
                         pending_count += 1;
                     }
                     Ok(Err(e)) => {
-                        warn!(market_id, tick, err = %e, "ask order send failed");
+                        warn!(market_id, tick, nonce, err = %e, "ask order send failed");
                     }
                     Err(_) => {
-                        warn!(market_id, tick, "ask order send timed out after 5s");
+                        warn!(market_id, tick, nonce, "ask order send timed out after 5s");
                     }
                 }
             }
@@ -235,12 +258,13 @@ where
                 info!(market_id, order_id = %order_id, "[DRY RUN] would cancel");
                 continue;
             }
+            let nonce = self.next_nonce();
             match tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                self.order_book.cancelOrder(*order_id).send(),
+                self.order_book.cancelOrder(*order_id).nonce(nonce).send(),
             ).await {
                 Ok(Ok(pending)) => {
-                    info!(market_id, order_id = %order_id, tx = %pending.tx_hash(), "cancel sent");
+                    info!(market_id, order_id = %order_id, nonce, tx = %pending.tx_hash(), "cancel sent");
                 }
                 Ok(Err(e)) => {
                     // "already cancelled/filled" is expected — don't warn loudly

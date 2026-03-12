@@ -107,6 +107,9 @@ async fn main() -> Result<()> {
         quoter::approve_vault(usdt_addr, vault_addr, provider.clone()).await?;
     }
 
+    // Wait for approval to mine, then sync nonce
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
     // Shared state
     let (price_tx, price_rx) = watch::channel(None);
     let returns: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
@@ -127,6 +130,7 @@ async fn main() -> Result<()> {
         cfg.quoting.clone(),
         cli.dry_run,
     );
+    quoter.sync_nonce(signer_addr).await?;
     let mut market_mgr = market_manager::MarketManager::new();
     let mut risk_mgr = risk::RiskManager::new(
         cfg.risk.max_position_per_market,
