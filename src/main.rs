@@ -31,13 +31,11 @@ struct Cli {
 
 #[derive(Debug, Clone, Deserialize)]
 struct IndexerOrder {
-    id: String,
-    market_id: u64,
+    id: i64,
+    market_id: i64,
     side: String,
-    #[allow(dead_code)]
     tick: u64,
     lots: u64,
-    #[allow(dead_code)]
     filled_lots: u64,
     status: String,
 }
@@ -139,7 +137,7 @@ async fn main() -> Result<()> {
     let mm_address = format!("{signer_addr:#x}");
 
     // Track previous order states for fill detection
-    let mut prev_order_states: HashMap<String, IndexerOrder> = HashMap::new();
+    let mut prev_order_states: HashMap<i64, IndexerOrder> = HashMap::new();
 
     // Graceful shutdown handler
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -255,7 +253,7 @@ async fn main() -> Result<()> {
                 // Poll positions for fill tracking
                 match fetch_positions(&http_client, &cfg.indexer.url, &mm_address).await {
                     Ok(orders) => {
-                        let mut new_states: HashMap<String, IndexerOrder> = HashMap::new();
+                        let mut new_states: HashMap<i64, IndexerOrder> = HashMap::new();
                         for order in &orders {
                             // Detect transitions to filled
                             if order.status == "filled" {
@@ -264,7 +262,7 @@ async fn main() -> Result<()> {
                                         let sign: i64 = if order.side == "bid" { 1 } else { -1 };
                                         let lots = order.lots as i64 * sign;
                                         info!(
-                                            order_id = %order.id,
+                                            order_id = order.id,
                                             market_id = order.market_id,
                                             side = %order.side,
                                             tick = order.tick,
@@ -272,11 +270,11 @@ async fn main() -> Result<()> {
                                             signed_lots = lots,
                                             "FILL DETECTED — position updated"
                                         );
-                                        risk_mgr.record_fill(order.market_id, lots);
+                                        risk_mgr.record_fill(order.market_id as u64, lots);
                                     }
                                 }
                             }
-                            new_states.insert(order.id.clone(), order.clone());
+                            new_states.insert(order.id, order.clone());
                         }
                         prev_order_states = new_states;
                     }
