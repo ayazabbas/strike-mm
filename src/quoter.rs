@@ -71,6 +71,8 @@ where
     }
 
     /// Place bid and ask orders for a market at computed ticks.
+    /// Sends all txs sequentially (nonce management) but does NOT wait for receipts.
+    /// Order IDs are tracked via the indexer instead.
     pub async fn place_quotes(
         &mut self,
         market_id: u64,
@@ -82,8 +84,7 @@ where
         let market_id_u256 = U256::from(market_id);
         let lots = U256::from(self.config.lots_per_level);
 
-        let mut bid_ids = Vec::new();
-        let mut ask_ids = Vec::new();
+        let mut pending_count = 0u32;
 
         // Place bid levels
         for level in 0..self.config.num_levels {
@@ -99,41 +100,22 @@ where
             }
 
             if self.dry_run {
-                info!(
-                    market_id,
-                    side = "bid",
-                    tick,
-                    lots = self.config.lots_per_level,
-                    "[DRY RUN] would place order"
-                );
-                bid_ids.push(U256::ZERO);
+                info!(market_id, side = "bid", tick, lots = self.config.lots_per_level, "[DRY RUN] would place order");
             } else {
-                let place_fut = async {
-                    let pending = self.order_book
-                        .placeOrder(market_id_u256, 0, 1, U256::from(tick), lots)
-                        .send().await.map_err(|e| eyre::eyre!("{e}"))?;
-                    pending.get_receipt().await.map_err(|e| eyre::eyre!("{e}"))
-                };
-                match tokio::time::timeout(std::time::Duration::from_secs(15), place_fut).await {
-                    Ok(Ok(receipt)) => {
-                        let order_id = parse_order_id_from_receipt(&receipt)
-                            .unwrap_or(U256::ZERO);
-                        info!(
-                            market_id,
-                            side = "bid",
-                            tick,
-                            lots = self.config.lots_per_level,
-                            tx = %receipt.transaction_hash,
-                            order_id = %order_id,
-                            "order placed"
-                        );
-                        bid_ids.push(order_id);
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    self.order_book.placeOrder(market_id_u256, 0, 1, U256::from(tick), lots).send(),
+                ).await {
+                    Ok(Ok(pending)) => {
+                        let tx_hash = *pending.tx_hash();
+                        info!(market_id, side = "bid", tick, lots = self.config.lots_per_level, tx = %tx_hash, "order sent (not waiting for receipt)");
+                        pending_count += 1;
                     }
                     Ok(Err(e)) => {
-                        warn!(market_id, tick, err = %e, "bid order failed");
+                        warn!(market_id, tick, err = %e, "bid order send failed");
                     }
                     Err(_) => {
-                        warn!(market_id, tick, "bid order timed out after 15s");
+                        warn!(market_id, tick, "bid order send timed out after 5s");
                     }
                 }
             }
@@ -153,51 +135,34 @@ where
             }
 
             if self.dry_run {
-                info!(
-                    market_id,
-                    side = "ask",
-                    tick,
-                    lots = self.config.lots_per_level,
-                    "[DRY RUN] would place order"
-                );
-                ask_ids.push(U256::ZERO);
+                info!(market_id, side = "ask", tick, lots = self.config.lots_per_level, "[DRY RUN] would place order");
             } else {
-                let place_fut = async {
-                    let pending = self.order_book
-                        .placeOrder(market_id_u256, 1, 1, U256::from(tick), lots)
-                        .send().await.map_err(|e| eyre::eyre!("{e}"))?;
-                    pending.get_receipt().await.map_err(|e| eyre::eyre!("{e}"))
-                };
-                match tokio::time::timeout(std::time::Duration::from_secs(15), place_fut).await {
-                    Ok(Ok(receipt)) => {
-                        let order_id = parse_order_id_from_receipt(&receipt)
-                            .unwrap_or(U256::ZERO);
-                        info!(
-                            market_id,
-                            side = "ask",
-                            tick,
-                            lots = self.config.lots_per_level,
-                            tx = %receipt.transaction_hash,
-                            order_id = %order_id,
-                            "order placed"
-                        );
-                        ask_ids.push(order_id);
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    self.order_book.placeOrder(market_id_u256, 1, 1, U256::from(tick), lots).send(),
+                ).await {
+                    Ok(Ok(pending)) => {
+                        let tx_hash = *pending.tx_hash();
+                        info!(market_id, side = "ask", tick, lots = self.config.lots_per_level, tx = %tx_hash, "order sent (not waiting for receipt)");
+                        pending_count += 1;
                     }
                     Ok(Err(e)) => {
-                        warn!(market_id, tick, err = %e, "ask order failed");
+                        warn!(market_id, tick, err = %e, "ask order send failed");
                     }
                     Err(_) => {
-                        warn!(market_id, tick, "ask order timed out after 15s");
+                        warn!(market_id, tick, "ask order send timed out after 5s");
                     }
                 }
             }
         }
 
+        info!(market_id, pending_count, bid_tick, ask_tick, "quotes sent");
+
         self.active_orders.insert(
             market_id,
             MarketOrders {
-                bid_order_ids: bid_ids,
-                ask_order_ids: ask_ids,
+                bid_order_ids: vec![], // tracked via indexer now
+                ask_order_ids: vec![],
                 last_bid_tick: bid_tick,
                 last_ask_tick: ask_tick,
                 last_fair_tick: fair_tick,
@@ -209,48 +174,89 @@ where
     }
 
     /// Cancel all active orders for a market.
+    /// Uses locally tracked order IDs (may be empty if orders were fire-and-forget).
+    /// For reliable cancel, use cancel_all_via_indexer() which fetches IDs from the indexer.
     pub async fn cancel_all(&mut self, market_id: u64) -> Result<()> {
-        let orders = match self.active_orders.remove(&market_id) {
-            Some(o) => o,
-            None => return Ok(()),
+        self.active_orders.remove(&market_id);
+        // With fire-and-forget order placement, we don't have order IDs locally.
+        // Cancellation happens via cancel_all_via_indexer in the main loop.
+        info!(market_id, "cleared local order tracking");
+        Ok(())
+    }
+
+    /// Cancel all open orders for this market by querying the indexer for order IDs.
+    pub async fn cancel_via_indexer(
+        &mut self,
+        market_id: u64,
+        http_client: &reqwest::Client,
+        indexer_url: &str,
+        mm_address: &str,
+    ) -> Result<()> {
+        // Fetch our open orders from the indexer
+        let url = format!("{indexer_url}/positions/{mm_address}");
+        let resp = match http_client.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(market_id, err = %e, "cancel: failed to fetch positions");
+                return Ok(());
+            }
         };
 
-        let all_ids: Vec<U256> = orders
-            .bid_order_ids
-            .iter()
-            .chain(orders.ask_order_ids.iter())
-            .copied()
-            .filter(|id| *id != U256::ZERO)
-            .collect();
+        let data: serde_json::Value = match resp.json().await {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(market_id, err = %e, "cancel: failed to parse positions");
+                return Ok(());
+            }
+        };
 
-        for order_id in &all_ids {
+        let open_orders = data["open_orders"].as_array();
+        let order_ids: Vec<U256> = open_orders
+            .map(|orders| {
+                orders
+                    .iter()
+                    .filter(|o| {
+                        o["market_id"].as_i64() == Some(market_id as i64)
+                            && o["status"].as_str() == Some("open")
+                    })
+                    .filter_map(|o| o["id"].as_i64().map(|id| U256::from(id as u64)))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if order_ids.is_empty() {
+            return Ok(());
+        }
+
+        info!(market_id, count = order_ids.len(), "cancelling orders via indexer");
+
+        for order_id in &order_ids {
             if self.dry_run {
-                info!(market_id, order_id = %order_id, "[DRY RUN] would cancel order");
-            } else {
-                let cancel_fut = async {
-                    let pending = self.order_book.cancelOrder(*order_id).send().await.map_err(|e| eyre::eyre!("{e}"))?;
-                    pending.get_receipt().await.map_err(|e| eyre::eyre!("{e}"))
-                };
-                match tokio::time::timeout(std::time::Duration::from_secs(15), cancel_fut).await {
-                    Ok(Ok(receipt)) => {
-                        info!(
-                            market_id,
-                            order_id = %order_id,
-                            tx = %receipt.transaction_hash,
-                            "order cancelled"
-                        );
+                info!(market_id, order_id = %order_id, "[DRY RUN] would cancel");
+                continue;
+            }
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.order_book.cancelOrder(*order_id).send(),
+            ).await {
+                Ok(Ok(pending)) => {
+                    info!(market_id, order_id = %order_id, tx = %pending.tx_hash(), "cancel sent");
+                }
+                Ok(Err(e)) => {
+                    // "already cancelled/filled" is expected — don't warn loudly
+                    let msg = e.to_string();
+                    if msg.contains("already cancelled") || msg.contains("already cancelled/filled") {
+                        info!(market_id, order_id = %order_id, "already cancelled/filled — skipping");
+                    } else {
+                        warn!(market_id, order_id = %order_id, err = %e, "cancel send failed");
                     }
-                    Ok(Err(e)) => {
-                        warn!(market_id, order_id = %order_id, err = %e, "cancel failed (tx error)");
-                    }
-                    Err(_) => {
-                        warn!(market_id, order_id = %order_id, "cancel timed out after 15s — skipping");
-                    }
+                }
+                Err(_) => {
+                    warn!(market_id, order_id = %order_id, "cancel send timed out after 5s");
                 }
             }
         }
 
-        info!(market_id, count = all_ids.len(), "cancelled all orders");
         Ok(())
     }
 
@@ -285,7 +291,7 @@ where
         fair_diff >= self.config.requote_cents
     }
 
-    /// Requote: cancel existing orders and place new ones.
+    /// Requote: cancel existing orders via indexer and place new ones.
     pub async fn requote(
         &mut self,
         market_id: u64,
@@ -293,10 +299,13 @@ where
         ask_tick: u64,
         fair_tick: i64,
         risk: &mut RiskManager,
+        http_client: &reqwest::Client,
+        indexer_url: &str,
+        mm_address: &str,
     ) -> Result<()> {
-        self.cancel_all(market_id).await?;
+        self.cancel_via_indexer(market_id, http_client, indexer_url, mm_address).await?;
+        self.active_orders.remove(&market_id);
         self.place_quotes(market_id, bid_tick, ask_tick, fair_tick, risk).await?;
-        info!(market_id, bid_tick, ask_tick, "requoted");
         Ok(())
     }
 

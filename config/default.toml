@@ -1,5 +1,5 @@
 [rpc]
-url = "https://data-seed-prebsc-1-s1.bnbchain.org:8545"
+url = "https://bsc-testnet.core.chainstack.com/e602061228197d446d43e62320004d74"
 chain_id = 97
 
 [wallet]

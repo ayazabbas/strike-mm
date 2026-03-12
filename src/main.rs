@@ -244,6 +244,7 @@ async fn main() -> Result<()> {
                 // Cancel orders on expired markets
                 for market_id in &expired_markets {
                     info!(market_id, "MARKET EXPIRED — cancelling all orders");
+                    quoter.cancel_via_indexer(*market_id, &http_client, &cfg.indexer.url, &mm_address).await?;
                     quoter.cancel_all(*market_id).await?;
                     let final_pos = risk_mgr.position(*market_id);
                     info!(market_id, final_position = final_pos, "final position on expired market");
@@ -334,7 +335,7 @@ async fn main() -> Result<()> {
                             "REQUOTING"
                         );
                         quoter
-                            .requote(market_id, bid_tick, ask_tick, fair_tick, &mut risk_mgr)
+                            .requote(market_id, bid_tick, ask_tick, fair_tick, &mut risk_mgr, &http_client, &cfg.indexer.url, &mm_address)
                             .await?;
                     } else {
                         // Log why we didn't requote (at debug level to avoid spam)
