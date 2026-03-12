@@ -42,7 +42,7 @@ pub struct QuotingConfig {
     pub spread_ticks: u64,
     pub lots_per_level: u64,
     pub num_levels: u64,
-    pub requote_threshold_ticks: u64,
+    pub requote_cents: u64,
     pub requote_cooldown_secs: u64,
     pub min_expiry_secs: u64,
 }

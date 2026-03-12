@@ -18,7 +18,7 @@ poll_interval_secs = 5
 spread_ticks = 6
 lots_per_level = 5
 num_levels = 2
-requote_threshold_ticks = 2
+requote_cents = 10
 requote_cooldown_secs = 2
 min_expiry_secs = 30
 

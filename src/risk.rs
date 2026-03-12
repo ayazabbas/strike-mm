@@ -75,19 +75,16 @@ impl RiskManager {
         }
     }
 
-    /// Compute inventory skew in ticks for a market.
+    /// Compute proportional inventory skew in ticks for a market.
     /// Returns positive value to shift quotes down (encourage selling when long).
-    pub fn inventory_skew(&self, market_id: u64, skew_threshold: i64) -> i64 {
+    /// At max position, shifts by max_skew_ticks; scales linearly.
+    pub fn inventory_skew(&self, market_id: u64, max_skew_ticks: i64) -> i64 {
         let pos = self.position(market_id);
-        if pos.abs() > skew_threshold {
-            if pos > 0 {
-                1 // Long → shift down to encourage selling
-            } else {
-                -1 // Short → shift up to encourage buying
-            }
-        } else {
-            0
+        if self.max_position_per_market == 0 {
+            return 0;
         }
+        let ratio = pos as f64 / self.max_position_per_market as f64;
+        (ratio * max_skew_ticks as f64).round() as i64
     }
 }
 
@@ -135,14 +132,21 @@ mod tests {
     #[test]
     fn test_inventory_skew() {
         let mut rm = RiskManager::new(50, 200);
-        rm.record_fill(1, 35);
-        assert_eq!(rm.inventory_skew(1, 30), 1); // Long > threshold → positive skew
 
-        rm.record_fill(2, -35);
-        assert_eq!(rm.inventory_skew(2, 30), -1); // Short > threshold → negative skew
+        // At 50% of max position (25/50), skew = round(0.5 * 6) = 3
+        rm.record_fill(1, 25);
+        assert_eq!(rm.inventory_skew(1, 6), 3);
 
-        rm.record_fill(3, 10);
-        assert_eq!(rm.inventory_skew(3, 30), 0); // Within threshold → no skew
+        // At 100% of max position (50/50), skew = round(1.0 * 6) = 6
+        rm.record_fill(1, 25); // now at 50
+        assert_eq!(rm.inventory_skew(1, 6), 6);
+
+        // Negative position: at -50% (-25/50), skew = round(-0.5 * 6) = -3
+        rm.record_fill(2, -25);
+        assert_eq!(rm.inventory_skew(2, 6), -3);
+
+        // Zero position → no skew
+        assert_eq!(rm.inventory_skew(99, 6), 0);
     }
 
     #[test]

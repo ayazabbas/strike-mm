@@ -1,6 +1,7 @@
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use alloy::sol;
+use alloy::sol_types::SolEvent;
 use eyre::{Result, WrapErr};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -21,6 +22,16 @@ sol!(
     "abi/MockUSDT.json"
 );
 
+/// Extract the orderId from an OrderPlaced event in a transaction receipt.
+fn parse_order_id_from_receipt(receipt: &alloy::rpc::types::TransactionReceipt) -> Option<U256> {
+    for log in receipt.inner.logs() {
+        if let Ok(event) = OrderBook::OrderPlaced::decode_log(&log.inner) {
+            return Some(event.orderId);
+        }
+    }
+    None
+}
+
 /// Active orders we've placed for a market.
 #[derive(Debug, Clone)]
 pub struct MarketOrders {
@@ -28,6 +39,7 @@ pub struct MarketOrders {
     pub ask_order_ids: Vec<U256>,
     pub last_bid_tick: u64,
     pub last_ask_tick: u64,
+    pub last_fair_tick: i64,
     pub last_quote_time: Instant,
 }
 
@@ -64,6 +76,7 @@ where
         market_id: u64,
         bid_tick: u64,
         ask_tick: u64,
+        fair_tick: i64,
         risk: &mut RiskManager,
     ) -> Result<()> {
         let market_id_u256 = U256::from(market_id);
@@ -109,15 +122,18 @@ where
                 {
                     Ok(pending) => match pending.get_receipt().await {
                         Ok(receipt) => {
+                            let order_id = parse_order_id_from_receipt(&receipt)
+                                .unwrap_or(U256::ZERO);
                             info!(
                                 market_id,
                                 side = "bid",
                                 tick,
                                 lots = self.config.lots_per_level,
                                 tx = %receipt.transaction_hash,
+                                order_id = %order_id,
                                 "order placed"
                             );
-                            bid_ids.push(U256::ZERO); // TODO: parse orderId from event logs
+                            bid_ids.push(order_id);
                         }
                         Err(e) => {
                             warn!(market_id, tick, err = %e, "bid order receipt failed");
@@ -167,15 +183,18 @@ where
                 {
                     Ok(pending) => match pending.get_receipt().await {
                         Ok(receipt) => {
+                            let order_id = parse_order_id_from_receipt(&receipt)
+                                .unwrap_or(U256::ZERO);
                             info!(
                                 market_id,
                                 side = "ask",
                                 tick,
                                 lots = self.config.lots_per_level,
                                 tx = %receipt.transaction_hash,
+                                order_id = %order_id,
                                 "order placed"
                             );
-                            ask_ids.push(U256::ZERO);
+                            ask_ids.push(order_id);
                         }
                         Err(e) => {
                             warn!(market_id, tick, err = %e, "ask order receipt failed");
@@ -195,6 +214,7 @@ where
                 ask_order_ids: ask_ids,
                 last_bid_tick: bid_tick,
                 last_ask_tick: ask_tick,
+                last_fair_tick: fair_tick,
                 last_quote_time: Instant::now(),
             },
         );
@@ -255,12 +275,12 @@ where
         Ok(())
     }
 
-    /// Check if a market needs requoting based on price movement.
+    /// Check if a market needs requoting based on fair tick movement.
+    /// Requotes when |new_fair_tick - last_fair_tick| >= requote_cents.
     pub fn needs_requote(
         &self,
         market_id: u64,
-        new_bid_tick: u64,
-        new_ask_tick: u64,
+        new_fair_tick: i64,
     ) -> bool {
         let orders = match self.active_orders.get(&market_id) {
             Some(o) => o,
@@ -272,12 +292,9 @@ where
             return false;
         }
 
-        // Check if ticks have moved enough
-        let bid_diff = (new_bid_tick as i64 - orders.last_bid_tick as i64).unsigned_abs();
-        let ask_diff = (new_ask_tick as i64 - orders.last_ask_tick as i64).unsigned_abs();
-
-        bid_diff >= self.config.requote_threshold_ticks
-            || ask_diff >= self.config.requote_threshold_ticks
+        // Check if fair tick has moved enough
+        let fair_diff = (new_fair_tick - orders.last_fair_tick).unsigned_abs();
+        fair_diff >= self.config.requote_cents
     }
 
     /// Requote: cancel existing orders and place new ones.
@@ -286,10 +303,11 @@ where
         market_id: u64,
         bid_tick: u64,
         ask_tick: u64,
+        fair_tick: i64,
         risk: &mut RiskManager,
     ) -> Result<()> {
         self.cancel_all(market_id).await?;
-        self.place_quotes(market_id, bid_tick, ask_tick, risk).await?;
+        self.place_quotes(market_id, bid_tick, ask_tick, fair_tick, risk).await?;
         info!(market_id, bid_tick, ask_tick, "requoted");
         Ok(())
     }

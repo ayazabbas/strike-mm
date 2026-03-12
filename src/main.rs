@@ -10,6 +10,8 @@ use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use clap::Parser;
 use eyre::{Result, WrapErr};
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
@@ -25,6 +27,44 @@ struct Cli {
     /// Dry run mode — log orders without submitting transactions
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IndexerOrder {
+    id: String,
+    market_id: u64,
+    side: String,
+    #[allow(dead_code)]
+    tick: u64,
+    lots: u64,
+    #[allow(dead_code)]
+    filled_lots: u64,
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PositionsResponse {
+    open_orders: Vec<IndexerOrder>,
+    #[allow(dead_code)]
+    filled_positions: Vec<serde_json::Value>,
+}
+
+/// Fetch positions for the MM wallet from the indexer.
+async fn fetch_positions(
+    client: &reqwest::Client,
+    indexer_url: &str,
+    mm_address: &str,
+) -> Result<Vec<IndexerOrder>> {
+    let url = format!("{indexer_url}/positions/{mm_address}");
+    let resp: PositionsResponse = client
+        .get(&url)
+        .send()
+        .await
+        .wrap_err("fetching positions")?
+        .json()
+        .await
+        .wrap_err("parsing positions response")?;
+    Ok(resp.open_orders)
 }
 
 #[tokio::main]
@@ -96,6 +136,10 @@ async fn main() -> Result<()> {
     );
 
     let http_client = reqwest::Client::new();
+    let mm_address = format!("{signer_addr:#x}");
+
+    // Track previous order states for fill detection
+    let mut prev_order_states: HashMap<String, IndexerOrder> = HashMap::new();
 
     // Graceful shutdown handler
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -180,6 +224,37 @@ async fn main() -> Result<()> {
                     risk_mgr.remove_market(*market_id);
                 }
 
+                // Poll positions for fill tracking
+                match fetch_positions(&http_client, &cfg.indexer.url, &mm_address).await {
+                    Ok(orders) => {
+                        let mut new_states: HashMap<String, IndexerOrder> = HashMap::new();
+                        for order in &orders {
+                            // Detect transitions to filled
+                            if order.status == "filled" {
+                                if let Some(prev) = prev_order_states.get(&order.id) {
+                                    if prev.status != "filled" {
+                                        let sign: i64 = if order.side == "bid" { 1 } else { -1 };
+                                        let lots = order.lots as i64 * sign;
+                                        info!(
+                                            order_id = %order.id,
+                                            market_id = order.market_id,
+                                            side = %order.side,
+                                            lots,
+                                            "fill detected"
+                                        );
+                                        risk_mgr.record_fill(order.market_id, lots);
+                                    }
+                                }
+                            }
+                            new_states.insert(order.id.clone(), order.clone());
+                        }
+                        prev_order_states = new_states;
+                    }
+                    Err(e) => {
+                        warn!(err = %e, "failed to fetch positions — skipping fill check");
+                    }
+                }
+
                 // Quote on all active markets
                 let all_active: Vec<market_manager::Market> = markets;
                 for market in &all_active {
@@ -198,23 +273,25 @@ async fn main() -> Result<()> {
                     }
 
                     let fair = pricing::fair_value(btc_price, strike, vol, tte);
-                    let skew = risk_mgr.inventory_skew(market_id, 30);
+                    let fair_tick = (fair * 100.0).round() as i64;
+                    let skew = risk_mgr.inventory_skew(market_id, cfg.quoting.spread_ticks as i64);
                     let (bid_tick, ask_tick) =
                         pricing::compute_ticks(fair, cfg.quoting.spread_ticks, skew);
 
-                    if quoter.needs_requote(market_id, bid_tick, ask_tick) {
+                    if quoter.needs_requote(market_id, fair_tick) {
                         info!(
                             market_id,
                             btc_price,
                             strike,
                             fair = format!("{fair:.4}"),
+                            fair_tick,
                             bid_tick,
                             ask_tick,
                             skew,
                             "requoting"
                         );
                         quoter
-                            .requote(market_id, bid_tick, ask_tick, &mut risk_mgr)
+                            .requote(market_id, bid_tick, ask_tick, fair_tick, &mut risk_mgr)
                             .await?;
                     }
                 }
