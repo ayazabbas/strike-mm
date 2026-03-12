@@ -187,7 +187,9 @@ async fn main() -> Result<()> {
                     _ => {}
                 }
 
-                let btc_price = price_data.unwrap().price;
+                let pd = price_data.unwrap();
+                let btc_price = pd.price;
+                let price_age_ms = now_ms - pd.timestamp_ms;
 
                 // Determine volatility
                 let vol = match cfg.volatility.method.as_str() {
@@ -195,7 +197,13 @@ async fn main() -> Result<()> {
                         let rets = returns.lock().await;
                         let v = pricing::realized_vol(&rets);
                         if v < 0.01 {
-                            cfg.volatility.fixed_annual_vol // Fallback if not enough data
+                            info!(
+                                realized_vol = format!("{v:.6}"),
+                                fallback_vol = cfg.volatility.fixed_annual_vol,
+                                samples = rets.len(),
+                                "realized vol too low, using fixed"
+                            );
+                            cfg.volatility.fixed_annual_vol
                         } else {
                             v
                         }
@@ -209,7 +217,12 @@ async fn main() -> Result<()> {
                     &cfg.indexer.url,
                     cfg.quoting.min_expiry_secs,
                 ).await {
-                    Ok(m) => m,
+                    Ok(m) => {
+                        if m.is_empty() {
+                            info!("no active markets with >{} secs to expiry", cfg.quoting.min_expiry_secs);
+                        }
+                        m
+                    }
                     Err(e) => {
                         warn!(err = %e, "failed to fetch markets — skipping cycle");
                         continue;
@@ -218,9 +231,24 @@ async fn main() -> Result<()> {
 
                 let (new_markets, expired_markets) = market_mgr.reconcile(&markets);
 
+                for m in &new_markets {
+                    let strike_usd = m.strike_price.map(pricing::pyth_price_to_f64).unwrap_or(0.0);
+                    let secs_left = m.expiry_time - (now_ms / 1000) as i64;
+                    info!(
+                        market_id = m.id,
+                        strike = format!("{strike_usd:.2}"),
+                        secs_to_expiry = secs_left,
+                        batch_interval = m.batch_interval,
+                        "NEW MARKET — starting to quote"
+                    );
+                }
+
                 // Cancel orders on expired markets
                 for market_id in &expired_markets {
+                    info!(market_id, "MARKET EXPIRED — cancelling all orders");
                     quoter.cancel_all(*market_id).await?;
+                    let final_pos = risk_mgr.position(*market_id);
+                    info!(market_id, final_position = final_pos, "final position on expired market");
                     risk_mgr.remove_market(*market_id);
                 }
 
@@ -239,8 +267,10 @@ async fn main() -> Result<()> {
                                             order_id = %order.id,
                                             market_id = order.market_id,
                                             side = %order.side,
-                                            lots,
-                                            "fill detected"
+                                            tick = order.tick,
+                                            lots = order.lots,
+                                            signed_lots = lots,
+                                            "FILL DETECTED — position updated"
                                         );
                                         risk_mgr.record_fill(order.market_id, lots);
                                     }
@@ -262,37 +292,68 @@ async fn main() -> Result<()> {
                     let strike = match market.strike_price {
                         Some(sp) => pricing::pyth_price_to_f64(sp),
                         None => {
-                            warn!(market_id, "no strike price — skipping");
+                            warn!(market_id, "no strike price — skipping market");
                             continue;
                         }
                     };
 
                     let tte = pricing::time_to_expiry_years(market.expiry_time);
+                    let secs_left = (tte * 365.25 * 24.0 * 3600.0) as i64;
                     if tte <= 0.0 {
+                        info!(market_id, "market expired (tte<=0) — skipping quote");
                         continue;
                     }
 
                     let fair = pricing::fair_value(btc_price, strike, vol, tte);
                     let fair_tick = (fair * 100.0).round() as i64;
+                    let position = risk_mgr.position(market_id);
                     let skew = risk_mgr.inventory_skew(market_id, cfg.quoting.spread_ticks as i64);
                     let (bid_tick, ask_tick) =
                         pricing::compute_ticks(fair, cfg.quoting.spread_ticks, skew);
 
                     if quoter.needs_requote(market_id, fair_tick) {
+                        let reason = if !quoter.is_quoting(market_id) {
+                            "initial quote"
+                        } else {
+                            "fair value moved >= requote threshold"
+                        };
                         info!(
                             market_id,
-                            btc_price,
-                            strike,
+                            reason,
+                            btc_price = format!("{btc_price:.2}"),
+                            strike = format!("{strike:.2}"),
+                            price_diff = format!("{:.2}", btc_price - strike),
+                            vol = format!("{vol:.4}"),
+                            secs_left,
                             fair = format!("{fair:.4}"),
                             fair_tick,
+                            position,
+                            skew,
                             bid_tick,
                             ask_tick,
-                            skew,
-                            "requoting"
+                            spread = ask_tick as i64 - bid_tick as i64,
+                            price_age_ms,
+                            "REQUOTING"
                         );
                         quoter
                             .requote(market_id, bid_tick, ask_tick, fair_tick, &mut risk_mgr)
                             .await?;
+                    } else {
+                        // Log why we didn't requote (at debug level to avoid spam)
+                        if let Some(orders) = quoter.active_orders.get(&market_id) {
+                            let fair_diff = (fair_tick - orders.last_fair_tick).unsigned_abs();
+                            let cooldown_remaining = cfg.quoting.requote_cooldown_secs
+                                .saturating_sub(orders.last_quote_time.elapsed().as_secs());
+                            tracing::debug!(
+                                market_id,
+                                fair_tick,
+                                last_fair_tick = orders.last_fair_tick,
+                                fair_diff,
+                                requote_threshold = cfg.quoting.requote_cents,
+                                cooldown_remaining_secs = cooldown_remaining,
+                                "no requote needed"
+                            );
+                        }
                     }
                 }
             }
