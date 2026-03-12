@@ -19,7 +19,7 @@ spread_ticks = 6
 lots_per_level = 5
 num_levels = 2
 requote_cents = 10
-requote_cooldown_secs = 2
+requote_cooldown_secs = 15
 min_expiry_secs = 30
 
 [risk]

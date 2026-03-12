@@ -339,7 +339,7 @@ async fn main() -> Result<()> {
                             "REQUOTING"
                         );
                         quoter
-                            .requote(market_id, bid_tick, ask_tick, fair_tick, &mut risk_mgr, &http_client, &cfg.indexer.url, &mm_address)
+                            .requote(market_id, bid_tick, ask_tick, fair_tick, &mut risk_mgr, &http_client, &cfg.indexer.url, &mm_address, signer_addr)
                             .await?;
                     } else {
                         // Log why we didn't requote (at debug level to avoid spam)
