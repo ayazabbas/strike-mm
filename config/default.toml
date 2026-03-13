@@ -6,8 +6,8 @@ chain_id = 97
 private_key_env = "MM_PRIVATE_KEY"
 
 [contracts]
-order_book = "0xAFeeF2F0DBE473e4C2BC4b5981793F69804CfaD0"
-vault = "0xf7c51CC50F1589082850978BA8E779318299FeC9"
+order_book = "0xa4dE27DB7d95492311C1097349356354fF8A6859"
+vault = "0x3aE0D470D493AB834681Ce299D98A3cD3A118b90"
 usdt = "0x4Be5501EDDF6263984614840A13228D0ecbf8430"
 
 [indexer]
@@ -16,7 +16,7 @@ poll_interval_secs = 5
 
 [quoting]
 spread_ticks = 6
-lots_per_level = 5
+lots_per_level = 500
 num_levels = 2
 requote_cents = 10
 requote_cooldown_secs = 15
