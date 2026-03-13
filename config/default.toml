@@ -16,15 +16,15 @@ poll_interval_secs = 5
 
 [quoting]
 spread_ticks = 6
-lots_per_level = 500
+lots_per_level = 25000
 num_levels = 2
 requote_cents = 20
 requote_cooldown_secs = 15
 min_expiry_secs = 5
 
 [risk]
-max_position_per_market = 5000
-max_total_exposure = 20000
+max_position_per_market = 250000
+max_total_exposure = 1000000
 stale_data_timeout_secs = 10
 
 [volatility]
