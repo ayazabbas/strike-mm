@@ -23,8 +23,8 @@ requote_cooldown_secs = 15
 min_expiry_secs = 5
 
 [risk]
-max_position_per_market = 50
-max_total_exposure = 200
+max_position_per_market = 5000
+max_total_exposure = 20000
 stale_data_timeout_secs = 10
 
 [volatility]
