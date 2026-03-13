@@ -328,13 +328,13 @@ where
         mm_address: &str,
         mm_addr: Address,
     ) -> Result<()> {
-        // Resync nonce from chain to account for mined txs since last batch
+        // Resync nonce from chain before starting the cancel+place cycle
         self.sync_nonce(mm_addr).await?;
         self.cancel_via_indexer(market_id, http_client, indexer_url, mm_address).await?;
         self.active_orders.remove(&market_id);
-        // Brief delay to let cancel txs mine before placing new orders
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        self.sync_nonce(mm_addr).await?;
+        // No delay or resync — local nonce counter already advanced past cancel txs.
+        // Resyncing from chain here would get the pre-cancel nonce (cancels not mined yet)
+        // causing nonce collision with the first place order.
         self.place_quotes(market_id, bid_tick, ask_tick, fair_tick, risk).await?;
         Ok(())
     }
