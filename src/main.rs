@@ -289,7 +289,7 @@ async fn main() -> Result<()> {
                 // Cancel orders on expired markets
                 for market_id in &expired_markets {
                     info!(market_id, "MARKET EXPIRED — cancelling all orders");
-                    quoter.cancel_local_orders(*market_id).await?;
+                    quoter.cancel_all_orders(*market_id, &http_client, &cfg.indexer.url, &mm_address).await?;
                     let final_pos = risk_mgr.position(*market_id);
                     info!(market_id, final_position = final_pos, "final position on expired market");
                     risk_mgr.remove_market(*market_id);
@@ -355,7 +355,7 @@ async fn main() -> Result<()> {
                         if quoter.is_quoting(market_id) {
                             info!(market_id, fair_tick, secs_left, "PULLING QUOTES — fair at extreme");
                             quoter.sync_nonce(signer_addr).await?;
-                            quoter.cancel_local_orders(market_id).await?;
+                            quoter.cancel_all_orders(market_id, &http_client, &cfg.indexer.url, &mm_address).await?;
                         }
                         continue;
                     }
@@ -390,7 +390,7 @@ async fn main() -> Result<()> {
                             "REQUOTING"
                         );
                         quoter
-                            .requote(market_id, bid_tick, ask_tick, fair_tick, &mut risk_mgr, signer_addr)
+                            .requote(market_id, bid_tick, ask_tick, fair_tick, &mut risk_mgr, signer_addr, &http_client, &cfg.indexer.url, &mm_address)
                             .await?;
                     } else {
                         // Log why we didn't requote (at debug level to avoid spam)
