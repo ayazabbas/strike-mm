@@ -286,23 +286,38 @@ where
         tx.gas = Some(1_000_000);
 
         match tokio::time::timeout(
-            std::time::Duration::from_secs(15),
+            std::time::Duration::from_secs(30),
             self.order_book.provider().send_transaction(tx),
         ).await {
             Ok(Ok(pending)) => {
+                let tx_hash = *pending.tx_hash();
                 info!(
                     market_id,
                     count = order_ids.len(),
                     nonce,
-                    tx = %pending.tx_hash(),
-                    "multicall cancel sent"
+                    tx = %tx_hash,
+                    "multicall cancel sent — waiting for receipt"
                 );
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    pending.get_receipt(),
+                ).await {
+                    Ok(Ok(receipt)) => {
+                        info!(market_id, tx = %tx_hash, gas_used = receipt.gas_used, "multicall cancel confirmed");
+                    }
+                    Ok(Err(e)) => {
+                        warn!(market_id, tx = %tx_hash, err = %e, "multicall cancel receipt error");
+                    }
+                    Err(_) => {
+                        warn!(market_id, tx = %tx_hash, "multicall cancel receipt timed out after 30s");
+                    }
+                }
             }
             Ok(Err(e)) => {
                 warn!(market_id, err = %e, "multicall cancel failed");
             }
             Err(_) => {
-                warn!(market_id, "multicall cancel timed out after 15s");
+                warn!(market_id, "multicall cancel send timed out after 30s");
             }
         }
 
@@ -387,23 +402,38 @@ where
         tx.gas = Some(1_000_000);
 
         match tokio::time::timeout(
-            std::time::Duration::from_secs(15),
+            std::time::Duration::from_secs(30),
             self.order_book.provider().send_transaction(tx),
         ).await {
             Ok(Ok(pending)) => {
+                let tx_hash = *pending.tx_hash();
                 info!(
                     market_id,
                     count = order_ids.len(),
                     nonce,
-                    tx = %pending.tx_hash(),
-                    "multicall cancel sent"
+                    tx = %tx_hash,
+                    "multicall cancel sent — waiting for receipt"
                 );
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    pending.get_receipt(),
+                ).await {
+                    Ok(Ok(receipt)) => {
+                        info!(market_id, tx = %tx_hash, gas_used = receipt.gas_used, "multicall cancel confirmed");
+                    }
+                    Ok(Err(e)) => {
+                        warn!(market_id, tx = %tx_hash, err = %e, "multicall cancel receipt error");
+                    }
+                    Err(_) => {
+                        warn!(market_id, tx = %tx_hash, "multicall cancel receipt timed out after 30s");
+                    }
+                }
             }
             Ok(Err(e)) => {
                 warn!(market_id, err = %e, "multicall cancel failed");
             }
             Err(_) => {
-                warn!(market_id, "multicall cancel timed out after 15s");
+                warn!(market_id, "multicall cancel send timed out after 30s");
             }
         }
 
@@ -537,23 +567,44 @@ where
         tx.gas = Some(1_000_000);
 
         match tokio::time::timeout(
-            std::time::Duration::from_secs(15),
+            std::time::Duration::from_secs(30),
             self.order_book.provider().send_transaction(tx),
         ).await {
             Ok(Ok(pending)) => {
+                let tx_hash = *pending.tx_hash();
                 info!(
                     market_id,
                     count = all_ids.len(),
                     nonce,
-                    tx = %pending.tx_hash(),
-                    "multicall cancel sent"
+                    tx = %tx_hash,
+                    "multicall cancel sent — waiting for receipt"
                 );
+                // Wait for the cancel to mine before returning
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    pending.get_receipt(),
+                ).await {
+                    Ok(Ok(receipt)) => {
+                        info!(
+                            market_id,
+                            tx = %tx_hash,
+                            gas_used = receipt.gas_used,
+                            "multicall cancel confirmed"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        warn!(market_id, tx = %tx_hash, err = %e, "multicall cancel receipt error");
+                    }
+                    Err(_) => {
+                        warn!(market_id, tx = %tx_hash, "multicall cancel receipt timed out after 30s");
+                    }
+                }
             }
             Ok(Err(e)) => {
                 warn!(market_id, err = %e, "multicall cancel failed");
             }
             Err(_) => {
-                warn!(market_id, "multicall cancel timed out after 15s");
+                warn!(market_id, "multicall cancel send timed out after 30s");
             }
         }
 
@@ -574,9 +625,9 @@ where
         indexer_url: &str,
         mm_address: &str,
     ) -> Result<()> {
-        // Resync nonce from chain before starting the cancel+place cycle
-        self.sync_nonce(mm_addr).await?;
         self.cancel_all_orders(market_id, http_client, indexer_url, mm_address).await?;
+        // Re-sync nonce from chain AFTER cancel confirms, before placing new orders
+        self.sync_nonce(mm_addr).await?;
         self.place_quotes(market_id, bid_tick, ask_tick, fair_tick, risk).await?;
         Ok(())
     }
