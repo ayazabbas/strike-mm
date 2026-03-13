@@ -3,6 +3,7 @@ mod config;
 mod market_manager;
 mod pricing;
 mod quoter;
+mod redeemer;
 mod risk;
 
 use alloy::primitives::Address;
@@ -101,6 +102,8 @@ async fn main() -> Result<()> {
     let order_book_addr: Address = cfg.contracts.order_book.parse().wrap_err("bad order_book address")?;
     let vault_addr: Address = cfg.contracts.vault.parse().wrap_err("bad vault address")?;
     let usdt_addr: Address = cfg.contracts.usdt.parse().wrap_err("bad usdt address")?;
+    let redemption_addr: Address = cfg.contracts.redemption.parse().wrap_err("bad redemption address")?;
+    let outcome_token_addr: Address = cfg.contracts.outcome_token.parse().wrap_err("bad outcome_token address")?;
 
     // Approve vault for USDT spending (idempotent)
     if !cli.dry_run {
@@ -122,6 +125,22 @@ async fn main() -> Result<()> {
             error!(err = %e, "binance ws fatal error");
         }
     });
+
+    // Start redeemer background task (every 10 min, reclaims USDT from resolved markets)
+    if !cli.dry_run {
+        let redeem_provider = provider.clone();
+        let redeem_indexer_url = cfg.indexer.url.clone();
+        tokio::spawn(async move {
+            redeemer::run_redeem_loop(
+                redeem_provider,
+                redemption_addr,
+                outcome_token_addr,
+                signer_addr,
+                redeem_indexer_url,
+            )
+            .await;
+        });
+    }
 
     // Initialize components
     let mut quoter = quoter::Quoter::new(

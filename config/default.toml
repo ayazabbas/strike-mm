@@ -9,6 +9,8 @@ private_key_env = "MM_PRIVATE_KEY"
 order_book = "0x31EFda3d089CB5150b6aee57adDA3a7Aa97151A3"
 vault = "0xe19bB1799ed8C369980cb346014c68f83df1C294"
 usdt = "0x35c2731E24d88198cDc0128dD42fC2Ee969fB3fa"
+redemption = "0xdBd7dFFEbf8F7a2a3772832D03Ed0a87a57Fb776"
+outcome_token = "0x2C7E4d5b838D61141252b1c4c09618478C561f49"
 
 [indexer]
 url = "https://app.strike.pm/api"

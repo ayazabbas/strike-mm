@@ -29,6 +29,8 @@ pub struct ContractsConfig {
     pub order_book: String,
     pub vault: String,
     pub usdt: String,
+    pub redemption: String,
+    pub outcome_token: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
