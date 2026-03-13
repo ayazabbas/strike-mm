@@ -309,6 +309,15 @@ async fn main() -> Result<()> {
 
                     let fair = pricing::fair_value(btc_price, strike, vol, tte);
                     let fair_tick = (fair * 100.0).round() as i64;
+
+                    // Pull quotes if fair value is at extremes — no point quoting
+                    if (fair_tick <= 2 || fair_tick >= 98) && quoter.is_quoting(market_id) {
+                        info!(market_id, fair_tick, secs_left, "PULLING QUOTES — fair at extreme");
+                        quoter.cancel_via_indexer(market_id, &http_client, &cfg.indexer.url, &mm_address).await?;
+                        quoter.cancel_all(market_id).await?;
+                        continue;
+                    }
+
                     let position = risk_mgr.position(market_id);
                     let skew = risk_mgr.inventory_skew(market_id, cfg.quoting.spread_ticks as i64);
                     let (bid_tick, ask_tick) =
