@@ -316,6 +316,15 @@ where
                     tx = %pending.tx_hash(),
                     "multicall cancel sent"
                 );
+                // Notify indexer about cancelled orders (fire-and-forget)
+                let cancel_ids: Vec<i64> = order_ids.iter().map(|id| id.to::<i64>()).collect();
+                let cancel_url = format!("{indexer_url}/internal/cancel-orders");
+                let _ = http_client
+                    .post(&cancel_url)
+                    .json(&serde_json::json!({ "order_ids": cancel_ids }))
+                    .send()
+                    .await;
+                info!(market_id, count = cancel_ids.len(), "notified indexer of cancels");
             }
             Ok(Err(e)) => {
                 warn!(market_id, err = %e, "multicall cancel failed");
