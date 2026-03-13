@@ -1,12 +1,33 @@
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::Provider;
 use alloy::sol;
-use alloy::sol_types::SolEvent;
+use alloy::sol_types::{SolCall, SolEvent};
 use eyre::{Result, WrapErr};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::{info, warn};
+
+/// Multicall3 at canonical address (deployed on all major chains)
+const MULTICALL3: Address = Address::new([
+    0xca, 0x11, 0xbd, 0xe0, 0x59, 0x77, 0xb3, 0x63, 0x11, 0x67,
+    0x02, 0x88, 0x62, 0xbE, 0x2a, 0x17, 0x39, 0x76, 0xCA, 0x11,
+]);
+
+sol! {
+    struct Call3 {
+        address target;
+        bool allowFailure;
+        bytes callData;
+    }
+
+    struct MulticallResult {
+        bool success;
+        bytes returnData;
+    }
+
+    function aggregate3(Call3[] calldata calls) external payable returns (MulticallResult[] memory returnData);
+}
 
 use crate::config::QuotingConfig;
 use crate::risk::RiskManager;
@@ -251,33 +272,56 @@ where
             return Ok(());
         }
 
-        info!(market_id, count = order_ids.len(), "cancelling orders via indexer");
+        info!(market_id, count = order_ids.len(), "cancelling orders via multicall");
 
-        for order_id in &order_ids {
-            if self.dry_run {
+        if self.dry_run {
+            for order_id in &order_ids {
                 info!(market_id, order_id = %order_id, "[DRY RUN] would cancel");
-                continue;
             }
-            let nonce = self.next_nonce();
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                self.order_book.cancelOrder(*order_id).nonce(nonce).send(),
-            ).await {
-                Ok(Ok(pending)) => {
-                    info!(market_id, order_id = %order_id, nonce, tx = %pending.tx_hash(), "cancel sent");
+            return Ok(());
+        }
+
+        // Build Multicall3 aggregate3 call — batch all cancels into 1 tx
+        let ob_addr = *self.order_book.address();
+        let calls: Vec<Call3> = order_ids
+            .iter()
+            .map(|order_id| {
+                let calldata = OrderBook::cancelOrderCall { orderId: *order_id }.abi_encode();
+                Call3 {
+                    target: ob_addr,
+                    allowFailure: true, // allow individual cancels to fail (already cancelled)
+                    callData: Bytes::from(calldata),
                 }
-                Ok(Err(e)) => {
-                    // "already cancelled/filled" is expected — don't warn loudly
-                    let msg = e.to_string();
-                    if msg.contains("already cancelled") || msg.contains("already cancelled/filled") {
-                        info!(market_id, order_id = %order_id, "already cancelled/filled — skipping");
-                    } else {
-                        warn!(market_id, order_id = %order_id, err = %e, "cancel send failed");
-                    }
-                }
-                Err(_) => {
-                    warn!(market_id, order_id = %order_id, "cancel send timed out after 5s");
-                }
+            })
+            .collect();
+
+        let multicall_data = aggregate3Call { calls }.abi_encode();
+
+        let nonce = self.next_nonce();
+        let mut tx = alloy::rpc::types::TransactionRequest::default()
+            .to(MULTICALL3)
+            .input(Bytes::from(multicall_data).into())
+            .nonce(nonce);
+        tx.gas = Some(1_000_000);
+
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            self.order_book.provider().send_transaction(tx),
+        ).await {
+            Ok(Ok(pending)) => {
+                info!(
+                    market_id,
+                    count = order_ids.len(),
+                    nonce,
+                    tx = %pending.tx_hash(),
+                    "multicall cancel sent"
+                );
+            }
+            Ok(Err(e)) => {
+                warn!(market_id, err = %e, "multicall cancel failed");
+            }
+            Err(_) => {
+                warn!(market_id, "multicall cancel timed out after 15s");
             }
         }
 
