@@ -140,6 +140,28 @@ async fn main() -> Result<()> {
     let http_client = reqwest::Client::new();
     let mm_address = format!("{signer_addr:#x}");
 
+    // Startup cleanup: cancel any orphaned orders from a previous run via indexer
+    if !cli.dry_run {
+        info!("startup: cleaning up orphaned orders via indexer");
+        if let Ok(orders) = fetch_positions(&http_client, &cfg.indexer.url, &mm_address).await {
+            let market_ids: Vec<u64> = orders.iter()
+                .filter(|o| o.status == "open")
+                .map(|o| o.market_id as u64)
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            for &market_id in &market_ids {
+                if let Err(e) = quoter.cancel_via_indexer(market_id, &http_client, &cfg.indexer.url, &mm_address).await {
+                    warn!(market_id, err = %e, "startup: failed to cancel orphaned orders");
+                }
+            }
+            if !market_ids.is_empty() {
+                // Resync nonce after startup cancels
+                quoter.sync_nonce(signer_addr).await?;
+            }
+        }
+    }
+
     // Track previous order states for fill detection
     let mut prev_order_states: HashMap<i64, IndexerOrder> = HashMap::new();
 
@@ -248,8 +270,7 @@ async fn main() -> Result<()> {
                 // Cancel orders on expired markets
                 for market_id in &expired_markets {
                     info!(market_id, "MARKET EXPIRED — cancelling all orders");
-                    quoter.cancel_via_indexer(*market_id, &http_client, &cfg.indexer.url, &mm_address).await?;
-                    quoter.cancel_all(*market_id).await?;
+                    quoter.cancel_local_orders(*market_id).await?;
                     let final_pos = risk_mgr.position(*market_id);
                     info!(market_id, final_position = final_pos, "final position on expired market");
                     risk_mgr.remove_market(*market_id);
@@ -315,8 +336,7 @@ async fn main() -> Result<()> {
                         if quoter.is_quoting(market_id) {
                             info!(market_id, fair_tick, secs_left, "PULLING QUOTES — fair at extreme");
                             quoter.sync_nonce(signer_addr).await?;
-                            quoter.cancel_via_indexer(market_id, &http_client, &cfg.indexer.url, &mm_address).await?;
-                            quoter.cancel_all(market_id).await?;
+                            quoter.cancel_local_orders(market_id).await?;
                         }
                         continue;
                     }
@@ -351,7 +371,7 @@ async fn main() -> Result<()> {
                             "REQUOTING"
                         );
                         quoter
-                            .requote(market_id, bid_tick, ask_tick, fair_tick, &mut risk_mgr, &http_client, &cfg.indexer.url, &mm_address, signer_addr)
+                            .requote(market_id, bid_tick, ask_tick, fair_tick, &mut risk_mgr, signer_addr)
                             .await?;
                     } else {
                         // Log why we didn't requote (at debug level to avoid spam)
