@@ -332,8 +332,8 @@ where
         self.sync_nonce(mm_addr).await?;
         self.cancel_via_indexer(market_id, http_client, indexer_url, mm_address).await?;
         self.active_orders.remove(&market_id);
-        // Small delay to let cancel txs propagate before placing new orders
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        // Brief delay to let cancel txs mine before placing new orders
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         self.sync_nonce(mm_addr).await?;
         self.place_quotes(market_id, bid_tick, ask_tick, fair_tick, risk).await?;
         Ok(())
