@@ -4,9 +4,12 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 use eyre::Result;
 use std::collections::HashSet;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::market_manager::Market;
+use crate::nonce_sender::NonceSender;
 
 sol!(
     #[sol(rpc)]
@@ -71,6 +74,7 @@ async fn fetch_resolved_markets(
 /// Background task that redeems resolved market positions every 10 minutes.
 pub async fn run_redeem_loop<P>(
     provider: P,
+    nonce_sender: Arc<Mutex<NonceSender>>,
     redemption_addr: Address,
     outcome_token_addr: Address,
     mm_address: Address,
@@ -92,6 +96,7 @@ pub async fn run_redeem_loop<P>(
 
         if let Err(e) = redeem_cycle(
             &provider,
+            &nonce_sender,
             &client,
             redemption_addr,
             outcome_token_addr,
@@ -108,6 +113,7 @@ pub async fn run_redeem_loop<P>(
 
 async fn redeem_cycle<P>(
     provider: &P,
+    nonce_sender: &Arc<Mutex<NonceSender>>,
     client: &reqwest::Client,
     redemption_addr: Address,
     outcome_token_addr: Address,
@@ -135,6 +141,7 @@ where
 
         match try_redeem_market(
             provider,
+            nonce_sender,
             redemption_addr,
             outcome_token_addr,
             mm_address,
@@ -146,7 +153,6 @@ where
                 if did_redeem {
                     info!(market_id, "redeemer: successfully redeemed");
                 }
-                // Mark as redeemed regardless — no point rechecking markets with 0 balance
                 redeemed.insert(market_id);
             }
             Err(e) => {
@@ -160,6 +166,7 @@ where
 
 async fn try_redeem_market<P>(
     provider: &P,
+    nonce_sender: &Arc<Mutex<NonceSender>>,
     redemption_addr: Address,
     outcome_token_addr: Address,
     mm_address: Address,
@@ -198,7 +205,6 @@ where
     );
 
     // Build redeem calls — try both sides via multicall with allowFailure.
-    // The winning side will succeed, the losing side will revert harmlessly.
     let mut calls: Vec<Call3> = Vec::new();
 
     if !yes_balance.is_zero() {
@@ -229,20 +235,19 @@ where
         });
     }
 
-    // Sync nonce from chain
-    let nonce = provider.get_transaction_count(mm_address).await?;
-
+    // Build the multicall tx — NonceSender handles nonce
     let multicall_data = aggregate3Call { calls }.abi_encode();
     let mut tx = alloy::rpc::types::TransactionRequest::default()
         .to(MULTICALL3)
-        .input(Bytes::from(multicall_data).into())
-        .nonce(nonce);
+        .input(Bytes::from(multicall_data).into());
     tx.gas = Some(500_000);
 
     match tokio::time::timeout(
         std::time::Duration::from_secs(30),
         async {
-            let pending = provider.send_transaction(tx).await?;
+            let pending: crate::nonce_sender::PendingTx =
+                nonce_sender.lock().await.send(tx).await?;
+            // Lock released here — receipt wait is outside the lock
             let receipt = pending.get_receipt().await?;
             Ok::<_, eyre::Report>(receipt)
         },

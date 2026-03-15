@@ -28,7 +28,8 @@ indexer API → market_manager.rs ──────→ pricing.rs → quoter.rs
 
 Uses `alloy` v1 with `sol!` macro to generate type-safe contract bindings from ABI JSON files in `abi/`.
 
-- **placeOrder(marketId, side, orderType, tick, lots)** — side: 0=Bid, 1=Ask; orderType: 1=GTC; tick: 1-99; lots: count
+- **placeOrder(marketId, side, orderType, tick, lots)** — side: 0=Bid, 1=Ask, 2=SellYes, 3=SellNo; orderType: 0=GTC, 1=GTB; tick: 1-99; lots: count
+- **NOTE V7**: orderType is now 3rd param (was 4th in V4/V5/V6)
 - **cancelOrder(orderId)** — cancels a specific order
 - On startup, approves Vault for max USDT spend
 
