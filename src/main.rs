@@ -3,13 +3,14 @@ mod config;
 mod contracts;
 mod event_state;
 mod market_manager;
+mod nonce_sender;
 mod pricing;
 mod quoter;
 mod redeemer;
 mod risk;
 
 use alloy::primitives::Address;
-use alloy::providers::{Provider, ProviderBuilder, WsConnect};
+use alloy::providers::{DynProvider, Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Filter;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolEvent;
@@ -425,7 +426,7 @@ async fn main() -> Result<()> {
 
     // Approve vault for USDT spending (idempotent)
     if !cli.dry_run {
-        quoter::approve_vault(usdt_addr, vault_addr, provider.clone()).await?;
+        quoter::approve_vault(usdt_addr, vault_addr, signer_addr, provider.clone()).await?;
     }
 
     // Wait for approval to mine, then sync nonce
@@ -444,13 +445,23 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Create shared NonceSender — all tx sends go through this
+    let nonce_sender = Arc::new(Mutex::new(
+        nonce_sender::NonceSender::new(
+            DynProvider::new(provider.clone()),
+            signer_addr,
+        ).await?,
+    ));
+
     // Start redeemer background task (every 10 min, reclaims USDT from resolved markets)
     if !cli.dry_run {
         let redeem_provider = provider.clone();
+        let redeem_nonce_sender = Arc::clone(&nonce_sender);
         let redeem_indexer_url = cfg.indexer.url.clone();
         tokio::spawn(async move {
             redeemer::run_redeem_loop(
                 redeem_provider,
+                redeem_nonce_sender,
                 redemption_addr,
                 outcome_token_addr,
                 signer_addr,
@@ -464,10 +475,10 @@ async fn main() -> Result<()> {
     let mut quoter = quoter::Quoter::new(
         order_book_addr,
         provider.clone(),
+        Arc::clone(&nonce_sender),
         cfg.quoting.clone(),
         cli.dry_run,
     );
-    quoter.sync_nonce(signer_addr).await?;
     let mut market_mgr = market_manager::MarketManager::new();
     let mut risk_mgr = risk::RiskManager::new(
         cfg.risk.max_position_per_market,
@@ -484,8 +495,6 @@ async fn main() -> Result<()> {
             Ok(live_orders) => {
                 quoter.restore_state(live_orders);
                 quoter.startup_cancel_sweep().await?;
-                // Re-sync nonce after sweep
-                quoter.sync_nonce(signer_addr).await?;
             }
             Err(e) => {
                 warn!(err = %e, "startup: on-chain recovery failed — falling back to indexer cleanup");
@@ -501,9 +510,7 @@ async fn main() -> Result<()> {
                             warn!(market_id, err = %e, "startup: failed to cancel orphaned orders");
                         }
                     }
-                    if !market_ids.is_empty() {
-                        quoter.sync_nonce(signer_addr).await?;
-                    }
+                    // NonceSender handles nonce sync internally
                 }
             }
         }
@@ -695,7 +702,9 @@ async fn main() -> Result<()> {
                 // Cancel orders on expired markets and clean up shared state
                 for market_id in &expired_markets {
                     info!(market_id, "MARKET EXPIRED — cancelling all orders");
-                    quoter.cancel_local_orders(*market_id).await?;
+                    if !quoter.cancel_local_orders_batch(*market_id).await? {
+                        quoter.cancel_local_orders(*market_id).await?;
+                    }
                     let final_pos = risk_mgr.position(*market_id);
                     info!(market_id, final_position = final_pos, "final position on expired market");
                     risk_mgr.remove_market(*market_id);
@@ -787,7 +796,9 @@ async fn main() -> Result<()> {
                     if fair_tick <= 2 || fair_tick >= 98 {
                         if quoter.is_quoting(market_id) {
                             info!(market_id, fair_tick, secs_left, "PULLING QUOTES — fair at extreme");
-                            quoter.cancel_local_orders(market_id).await?;
+                            if !quoter.cancel_local_orders_batch(market_id).await? {
+                                quoter.cancel_local_orders(market_id).await?;
+                            }
                         }
                         continue;
                     }
@@ -822,7 +833,7 @@ async fn main() -> Result<()> {
                             "REQUOTING"
                         );
                         quoter
-                            .requote(market_id, bid_tick, ask_tick, fair_tick, &mut risk_mgr, signer_addr)
+                            .requote(market_id, bid_tick, ask_tick, fair_tick, &mut risk_mgr)
                             .await?;
                     } else {
                         // Log why we didn't requote (at debug level to avoid spam)

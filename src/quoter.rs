@@ -1,22 +1,24 @@
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::Provider;
-use alloy::rpc::types::Filter;
+use alloy::rpc::types::{Filter, TransactionRequest};
 use alloy::sol;
-use alloy::sol_types::SolEvent;
+use alloy::sol_types::{SolCall, SolEvent};
 use eyre::{Result, WrapErr};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::config::QuotingConfig;
+use crate::nonce_sender::{NonceSender, PendingTx};
+use crate::risk::RiskManager;
+
 /// BSC testnet OrderBook deployment block — scan from here on startup
-const DEPLOYMENT_BLOCK: u64 = 95285319;
+const DEPLOYMENT_BLOCK: u64 = 95880357;
 
 /// Maximum block range per log query (BSC testnet RPCs reject large ranges)
 const LOG_SCAN_CHUNK_SIZE: u64 = 50_000;
-
-use crate::config::QuotingConfig;
-use crate::risk::RiskManager;
 
 sol!(
     #[sol(rpc)]
@@ -170,13 +172,11 @@ pub struct MarketOrders {
 /// The Quoter manages order placement and cancellation on the OrderBook contract.
 pub struct Quoter<P> {
     order_book: OrderBook::OrderBookInstance<P>,
+    nonce_sender: Arc<Mutex<NonceSender>>,
     pub config: QuotingConfig,
     /// market_id → active orders
     pub active_orders: HashMap<u64, MarketOrders>,
     pub dry_run: bool,
-    /// Local nonce counter — incremented after each confirmed tx receipt
-    nonce: AtomicU64,
-    nonce_initialized: bool,
 }
 
 impl<P> Quoter<P>
@@ -186,37 +186,44 @@ where
     pub fn new(
         order_book_addr: Address,
         provider: P,
+        nonce_sender: Arc<Mutex<NonceSender>>,
         config: QuotingConfig,
         dry_run: bool,
     ) -> Self {
         Self {
             order_book: OrderBook::new(order_book_addr, provider),
+            nonce_sender,
             config,
             active_orders: HashMap::new(),
             dry_run,
-            nonce: AtomicU64::new(0),
-            nonce_initialized: false,
         }
     }
 
-    /// Sync nonce from the chain (call once at startup or after errors).
-    pub async fn sync_nonce(&mut self, address: Address) -> Result<()> {
-        let n = self.order_book.provider().get_transaction_count(address).await
-            .wrap_err("failed to get nonce")?;
-        self.nonce.store(n, Ordering::SeqCst);
-        self.nonce_initialized = true;
-        info!(nonce = n, "nonce synced from chain");
-        Ok(())
+    /// Helper: build a cancel TransactionRequest for a given order ID.
+    fn cancel_tx(&self, order_id: U256) -> TransactionRequest {
+        let calldata = OrderBook::cancelOrderCall { orderId: order_id }.abi_encode();
+        let mut tx = TransactionRequest::default()
+            .to(*self.order_book.address())
+            .input(Bytes::from(calldata).into());
+        tx.gas = Some(200_000);
+        tx
     }
 
-    /// Get current nonce without incrementing. Caller increments after confirmed receipt.
-    fn current_nonce(&self) -> u64 {
-        self.nonce.load(Ordering::SeqCst)
-    }
-
-    /// Increment nonce by 1 after a confirmed receipt.
-    fn increment_nonce(&self) {
-        self.nonce.fetch_add(1, Ordering::SeqCst);
+    /// Helper: build a placeOrder TransactionRequest.
+    fn place_tx(&self, market_id: U256, side: u8, tick: U256, lots: U256) -> TransactionRequest {
+        let calldata = OrderBook::placeOrderCall {
+            marketId: market_id,
+            side,
+            orderType: 1, // GTC
+            tick,
+            lots,
+        }
+        .abi_encode();
+        let mut tx = TransactionRequest::default()
+            .to(*self.order_book.address())
+            .input(Bytes::from(calldata).into());
+        tx.gas = Some(500_000);
+        tx
     }
 
     // ── Phase 1: Restore recovered state ──────────────────────────────
@@ -242,7 +249,6 @@ where
     // ── Phase 2: Startup Cancel Sweep ─────────────────────────────────
 
     /// Cancel ALL recovered live orders via sequential individual cancelOrder calls.
-    /// Catches errors per-order and continues (orders may already be expired/settled).
     pub async fn startup_cancel_sweep(&mut self) -> Result<()> {
         let all_ids: Vec<U256> = self.active_orders.values()
             .flat_map(|m| m.bid_order_ids.iter().chain(m.ask_order_ids.iter()))
@@ -264,13 +270,15 @@ where
             return Ok(());
         }
 
+        let ns = self.nonce_sender.clone();
         for order_id in &all_ids {
-            let nonce = self.current_nonce();
+            let tx = self.cancel_tx(*order_id);
             match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                self.order_book.cancelOrder(*order_id).nonce(nonce).gas(200_000).send(),
+                ns.lock().await.send(tx),
             ).await {
                 Ok(Ok(pending)) => {
+                    let pending: PendingTx = pending;
                     let tx_hash = *pending.tx_hash();
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(30),
@@ -278,15 +286,12 @@ where
                     ).await {
                         Ok(Ok(receipt)) => {
                             info!(order_id = %order_id, tx = %tx_hash, gas_used = receipt.gas_used, "startup cancel confirmed");
-                            self.increment_nonce();
                         }
                         Ok(Err(e)) => {
                             warn!(order_id = %order_id, tx = %tx_hash, err = %e, "startup cancel receipt error — continuing");
-                            self.increment_nonce(); // nonce was consumed
                         }
                         Err(_) => {
                             warn!(order_id = %order_id, tx = %tx_hash, "startup cancel receipt timed out — continuing");
-                            self.increment_nonce();
                         }
                     }
                 }
@@ -320,6 +325,8 @@ where
         let mut bid_order_ids: Vec<U256> = Vec::new();
         let mut ask_order_ids: Vec<U256> = Vec::new();
 
+        let ns = self.nonce_sender.clone();
+
         // Place bid levels
         for level in 0..self.config.num_levels {
             let tick = bid_tick.saturating_sub(level * 2);
@@ -333,16 +340,13 @@ where
                 continue;
             }
 
-            let nonce = self.current_nonce();
+            let tx = self.place_tx(market_id_u256, 0, U256::from(tick), lots);
             match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                self.order_book
-                    .placeOrder(market_id_u256, 0, 1, U256::from(tick), lots)
-                    .nonce(nonce)
-                    .gas(500_000)
-                    .send(),
+                ns.lock().await.send(tx),
             ).await {
                 Ok(Ok(pending)) => {
+                    let pending: PendingTx = pending;
                     let tx_hash = *pending.tx_hash();
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(30),
@@ -351,30 +355,23 @@ where
                         Ok(Ok(receipt)) => {
                             let ids = parse_order_ids_from_receipt(&receipt);
                             info!(
-                                market_id, side = "bid", tick, nonce,
+                                market_id, side = "bid", tick,
                                 tx = %tx_hash, gas_used = receipt.gas_used,
                                 order_ids = ?ids, "bid placed"
                             );
-                            self.increment_nonce();
                             bid_order_ids.extend(ids);
                         }
                         Ok(Err(e)) => {
                             warn!(market_id, side = "bid", tick, tx = %tx_hash, err = %e, "place receipt error");
-                            self.increment_nonce();
                         }
                         Err(_) => {
                             warn!(market_id, side = "bid", tick, tx = %tx_hash, "place receipt timed out");
-                            self.increment_nonce();
                         }
                     }
                 }
                 Ok(Err(e)) => {
-                    let err_str = e.to_string();
-                    if err_str.contains("nonce") {
-                        warn!(market_id, side = "bid", tick, err = %e, "nonce error placing bid — aborting remaining placements");
-                        break;
-                    }
-                    warn!(market_id, side = "bid", tick, err = %e, "place send failed");
+                    warn!(market_id, side = "bid", tick, err = %e, "place send failed — aborting remaining bids");
+                    break;
                 }
                 Err(_) => {
                     warn!(market_id, side = "bid", tick, "place send timed out");
@@ -395,16 +392,13 @@ where
                 continue;
             }
 
-            let nonce = self.current_nonce();
+            let tx = self.place_tx(market_id_u256, 1, U256::from(tick), lots);
             match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                self.order_book
-                    .placeOrder(market_id_u256, 1, 1, U256::from(tick), lots)
-                    .nonce(nonce)
-                    .gas(500_000)
-                    .send(),
+                ns.lock().await.send(tx),
             ).await {
                 Ok(Ok(pending)) => {
+                    let pending: PendingTx = pending;
                     let tx_hash = *pending.tx_hash();
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(30),
@@ -413,30 +407,23 @@ where
                         Ok(Ok(receipt)) => {
                             let ids = parse_order_ids_from_receipt(&receipt);
                             info!(
-                                market_id, side = "ask", tick, nonce,
+                                market_id, side = "ask", tick,
                                 tx = %tx_hash, gas_used = receipt.gas_used,
                                 order_ids = ?ids, "ask placed"
                             );
-                            self.increment_nonce();
                             ask_order_ids.extend(ids);
                         }
                         Ok(Err(e)) => {
                             warn!(market_id, side = "ask", tick, tx = %tx_hash, err = %e, "place receipt error");
-                            self.increment_nonce();
                         }
                         Err(_) => {
                             warn!(market_id, side = "ask", tick, tx = %tx_hash, "place receipt timed out");
-                            self.increment_nonce();
                         }
                     }
                 }
                 Ok(Err(e)) => {
-                    let err_str = e.to_string();
-                    if err_str.contains("nonce") {
-                        warn!(market_id, side = "ask", tick, err = %e, "nonce error placing ask — aborting remaining placements");
-                        break;
-                    }
-                    warn!(market_id, side = "ask", tick, err = %e, "place send failed");
+                    warn!(market_id, side = "ask", tick, err = %e, "place send failed — aborting remaining asks");
+                    break;
                 }
                 Err(_) => {
                     warn!(market_id, side = "ask", tick, "place send timed out");
@@ -480,13 +467,15 @@ where
             return Ok(());
         }
 
+        let ns = self.nonce_sender.clone();
         for order_id in &order_ids {
-            let nonce = self.current_nonce();
+            let tx = self.cancel_tx(*order_id);
             match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                self.order_book.cancelOrder(*order_id).nonce(nonce).gas(200_000).send(),
+                ns.lock().await.send(tx),
             ).await {
                 Ok(Ok(pending)) => {
+                    let pending: PendingTx = pending;
                     let tx_hash = *pending.tx_hash();
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(30),
@@ -494,15 +483,12 @@ where
                     ).await {
                         Ok(Ok(receipt)) => {
                             info!(market_id, order_id = %order_id, tx = %tx_hash, gas_used = receipt.gas_used, "cancel confirmed");
-                            self.increment_nonce();
                         }
                         Ok(Err(e)) => {
                             warn!(market_id, order_id = %order_id, tx = %tx_hash, err = %e, "cancel receipt error");
-                            self.increment_nonce();
                         }
                         Err(_) => {
                             warn!(market_id, order_id = %order_id, tx = %tx_hash, "cancel receipt timed out");
-                            self.increment_nonce();
                         }
                     }
                 }
@@ -519,8 +505,85 @@ where
         Ok(())
     }
 
+    /// Cancel all locally-tracked orders for a market in a single tx via cancelOrders().
+    /// Returns Ok(true) on success, Ok(false) if batch failed (caller should fall back).
+    pub async fn cancel_local_orders_batch(&mut self, market_id: u64) -> Result<bool> {
+        let order_ids: Vec<U256> = match self.active_orders.get(&market_id) {
+            Some(orders) => orders.bid_order_ids.iter()
+                .chain(orders.ask_order_ids.iter())
+                .copied()
+                .collect(),
+            None => return Ok(true),
+        };
+
+        if order_ids.is_empty() {
+            self.active_orders.remove(&market_id);
+            return Ok(true);
+        }
+
+        let count = order_ids.len();
+
+        if self.dry_run {
+            info!(market_id, count, "[DRY RUN] would batch cancel");
+            self.active_orders.remove(&market_id);
+            return Ok(true);
+        }
+
+        info!(market_id, count, "batch cancelling orders");
+
+        // Build cancelOrders call
+        let calldata = OrderBook::cancelOrdersCall { orderIds: order_ids }.abi_encode();
+        let mut tx = TransactionRequest::default()
+            .to(*self.order_book.address())
+            .input(Bytes::from(calldata).into());
+        tx.gas = Some(500_000); // batch needs more gas than single cancel
+
+        let ns = self.nonce_sender.clone();
+        let pending = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            ns.lock().await.send(tx),
+        ).await {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                warn!(market_id, err = %e, "batch cancel failed — falling back to sequential");
+                return Ok(false);
+            }
+            Err(_) => {
+                warn!(market_id, "batch cancel send timed out — falling back to sequential");
+                return Ok(false);
+            }
+        };
+
+        let pending: PendingTx = pending;
+        let tx_hash = *pending.tx_hash();
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            pending.get_receipt(),
+        ).await {
+            Ok(Ok(receipt)) => {
+                info!(
+                    market_id,
+                    count,
+                    tx = %receipt.transaction_hash,
+                    gas_used = receipt.gas_used,
+                    "batch cancel confirmed"
+                );
+            }
+            Ok(Err(e)) => {
+                warn!(market_id, tx = %tx_hash, err = %e, "batch cancel receipt error — falling back");
+                return Ok(false);
+            }
+            Err(_) => {
+                warn!(market_id, tx = %tx_hash, "batch cancel receipt timed out — falling back");
+                return Ok(false);
+            }
+        }
+
+        self.active_orders.remove(&market_id);
+        Ok(true)
+    }
+
     /// Cancel all open orders for this market by querying the indexer for order IDs.
-    /// Cancels each order individually via sequential calls.
     pub async fn cancel_via_indexer(
         &mut self,
         market_id: u64,
@@ -573,13 +636,15 @@ where
             return Ok(());
         }
 
+        let ns = self.nonce_sender.clone();
         for order_id in &order_ids {
-            let nonce = self.current_nonce();
+            let tx = self.cancel_tx(*order_id);
             match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                self.order_book.cancelOrder(*order_id).nonce(nonce).gas(200_000).send(),
+                ns.lock().await.send(tx),
             ).await {
                 Ok(Ok(pending)) => {
+                    let pending: PendingTx = pending;
                     let tx_hash = *pending.tx_hash();
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(30),
@@ -587,15 +652,12 @@ where
                     ).await {
                         Ok(Ok(receipt)) => {
                             info!(market_id, order_id = %order_id, tx = %tx_hash, gas_used = receipt.gas_used, "cancel confirmed");
-                            self.increment_nonce();
                         }
                         Ok(Err(e)) => {
                             warn!(market_id, order_id = %order_id, tx = %tx_hash, err = %e, "cancel receipt error");
-                            self.increment_nonce();
                         }
                         Err(_) => {
                             warn!(market_id, order_id = %order_id, tx = %tx_hash, "cancel receipt timed out");
-                            self.increment_nonce();
                         }
                     }
                 }
@@ -615,13 +677,14 @@ where
     pub async fn cancel_everything(&mut self) -> Result<()> {
         let market_ids: Vec<u64> = self.active_orders.keys().copied().collect();
         for market_id in market_ids {
-            self.cancel_local_orders(market_id).await?;
+            if !self.cancel_local_orders_batch(market_id).await? {
+                self.cancel_local_orders(market_id).await?;
+            }
         }
         Ok(())
     }
 
     /// Check if a market needs requoting based on fair tick movement.
-    /// Requotes when |new_fair_tick - last_fair_tick| >= requote_cents.
     pub fn needs_requote(
         &self,
         market_id: u64,
@@ -629,21 +692,19 @@ where
     ) -> bool {
         let orders = match self.active_orders.get(&market_id) {
             Some(o) => o,
-            None => return true, // No existing orders → need to quote
+            None => return true,
         };
 
-        // Check cooldown
         if orders.last_quote_time.elapsed().as_secs() < self.config.requote_cooldown_secs {
             return false;
         }
 
-        // Check if fair tick has moved enough
         let fair_diff = (new_fair_tick - orders.last_fair_tick).unsigned_abs();
         fair_diff >= self.config.requote_cents
     }
 
-    /// Requote: cancel existing orders, sync nonce, then place new ones.
-    /// All calls are sequential individual transactions from the MM wallet.
+    /// Requote: cancel existing orders, then place new ones.
+    /// NonceSender handles nonce management — no manual sync needed.
     pub async fn requote(
         &mut self,
         market_id: u64,
@@ -651,15 +712,10 @@ where
         ask_tick: u64,
         fair_tick: i64,
         risk: &mut RiskManager,
-        mm_addr: Address,
     ) -> Result<()> {
-        // Cancel existing orders
-        self.cancel_local_orders(market_id).await?;
-
-        // Re-sync nonce after cancels
-        self.sync_nonce(mm_addr).await?;
-
-        // Place new quotes
+        if !self.cancel_local_orders_batch(market_id).await? {
+            self.cancel_local_orders(market_id).await?;
+        }
         self.place_quotes(market_id, bid_tick, ask_tick, fair_tick, risk).await
     }
 
@@ -674,7 +730,6 @@ where
     }
 
     /// Look up which side an order was placed on (from active_orders).
-    /// Returns Some("bid") or Some("ask"), or None if order not found.
     pub fn order_side(&self, order_id: U256) -> Option<&'static str> {
         for orders in self.active_orders.values() {
             if orders.bid_order_ids.contains(&order_id) {
@@ -688,7 +743,6 @@ where
     }
 
     /// Look up which market an order belongs to (from active_orders).
-    /// Returns Some(market_id) or None if order not found.
     pub fn order_market(&self, order_id: U256) -> Option<u64> {
         for (&market_id, orders) in &self.active_orders {
             if orders.bid_order_ids.contains(&order_id)
@@ -705,6 +759,7 @@ where
 pub async fn approve_vault<P>(
     usdt_addr: Address,
     vault_addr: Address,
+    signer_addr: Address,
     provider: P,
 ) -> Result<()>
 where
@@ -712,6 +767,14 @@ where
 {
     let usdt = MockUSDT::new(usdt_addr, provider);
     let max_approval = U256::MAX;
+
+    // Check current allowance — skip if already max-approved (idempotent)
+    if let Ok(current) = usdt.allowance(signer_addr, vault_addr).call().await {
+        if current >= (U256::MAX >> 1) {
+            info!("vault already approved for USDT — skipping");
+            return Ok(());
+        }
+    }
 
     info!("approving vault for max USDT spend...");
     let pending = usdt
