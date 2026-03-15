@@ -16,6 +16,7 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RpcConfig {
     pub url: String,
+    pub wss_url: Option<String>,
     pub chain_id: u64,
 }
 
@@ -31,6 +32,8 @@ pub struct ContractsConfig {
     pub usdt: String,
     pub redemption: String,
     pub outcome_token: String,
+    pub batch_auction: Option<String>,
+    pub market_factory: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -10,6 +10,7 @@ alloy = { version = "1", features = [
     "sol-types",
     "contract",
     "provider-http",
+    "provider-ws",
     "signer-local",
     "json-abi",
 ] }

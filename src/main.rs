@@ -1,5 +1,7 @@
 mod binance;
 mod config;
+mod contracts;
+mod event_state;
 mod market_manager;
 mod pricing;
 mod quoter;
@@ -7,8 +9,10 @@ mod redeemer;
 mod risk;
 
 use alloy::primitives::Address;
-use alloy::providers::ProviderBuilder;
+use alloy::providers::{Provider, ProviderBuilder, WsConnect};
+use alloy::rpc::types::Filter;
 use alloy::signers::local::PrivateKeySigner;
+use alloy::sol_types::SolEvent;
 use clap::Parser;
 use eyre::{Result, WrapErr};
 use serde::Deserialize;
@@ -17,6 +21,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 use tracing::{error, info, warn};
+
+use contracts::{BatchAuction, MarketFactory};
+use event_state::{EventState, FillEvent};
+
+/// BTC/USD Pyth feed ID (mainnet) as bytes32.
+const BTC_USD_PRICE_ID: &str =
+    "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43";
 
 #[derive(Parser)]
 #[command(name = "strike-mm", about = "Strike Market Maker Bot")]
@@ -66,6 +77,305 @@ async fn fetch_positions(
     Ok(resp.open_orders)
 }
 
+// ── WS Event Subscription Tasks ──────────────────────────────────────
+
+/// Subscribe to MarketCreated events from MarketFactory.
+/// Adds new BTC/USD markets to shared state.
+async fn run_market_created_subscriber(
+    wss_url: String,
+    market_factory_addr: Address,
+    shared_state: Arc<Mutex<EventState>>,
+    min_expiry_secs: u64,
+) {
+    loop {
+        match try_subscribe_market_created(
+            &wss_url,
+            market_factory_addr,
+            &shared_state,
+            min_expiry_secs,
+        )
+        .await
+        {
+            Ok(()) => {
+                info!("MarketCreated subscriber exited cleanly");
+                break;
+            }
+            Err(e) => {
+                warn!(err = %e, "MarketCreated subscription dropped — reconnecting in 5s");
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+async fn try_subscribe_market_created(
+    wss_url: &str,
+    market_factory_addr: Address,
+    shared_state: &Arc<Mutex<EventState>>,
+    min_expiry_secs: u64,
+) -> Result<()> {
+    let ws = WsConnect::new(wss_url);
+    let provider = ProviderBuilder::new().connect_ws(ws).await
+        .wrap_err("failed to connect WS for MarketCreated")?;
+
+    let filter = Filter::new()
+        .address(market_factory_addr)
+        .event_signature(MarketFactory::MarketCreated::SIGNATURE_HASH);
+
+    let sub = provider
+        .subscribe_logs(&filter)
+        .await
+        .wrap_err("failed to subscribe to MarketCreated")?;
+
+    info!("subscribed to MarketCreated events");
+
+    let mut stream = sub.into_stream();
+    use futures_util::StreamExt;
+
+    while let Some(log) = stream.next().await {
+        match MarketFactory::MarketCreated::decode_log(&log.inner) {
+            Ok(event) => {
+                let price_id = format!("0x{}", alloy::hex::encode(event.priceId));
+                let order_book_market_id = event.orderBookMarketId.to::<u64>();
+                let strike_price = event.strikePrice;
+                let expiry_time = event.expiryTime.to::<i64>();
+
+                // Filter: only BTC/USD markets
+                if price_id != BTC_USD_PRICE_ID {
+                    tracing::debug!(
+                        order_book_market_id,
+                        price_id,
+                        "ignoring non-BTC/USD MarketCreated"
+                    );
+                    continue;
+                }
+
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64;
+
+                if expiry_time <= now + min_expiry_secs as i64 {
+                    tracing::debug!(
+                        order_book_market_id,
+                        expiry_time,
+                        "ignoring MarketCreated — too close to expiry"
+                    );
+                    continue;
+                }
+
+                let market = market_manager::Market {
+                    id: order_book_market_id as i64,
+                    expiry_time,
+                    status: "active".to_string(),
+                    pyth_feed_id: Some(price_id),
+                    strike_price: Some(strike_price),
+                    batch_interval: 3, // default; not in event
+                };
+
+                info!(
+                    order_book_market_id,
+                    strike_price,
+                    expiry_time,
+                    "MarketCreated event — new BTC/USD market discovered"
+                );
+
+                shared_state.lock().await.active_markets.insert(
+                    order_book_market_id,
+                    market,
+                );
+            }
+            Err(e) => {
+                warn!(err = %e, "failed to decode MarketCreated event");
+            }
+        }
+    }
+
+    eyre::bail!("MarketCreated stream ended")
+}
+
+/// Subscribe to OrderSettled and GtcAutoCancelled events from BatchAuction.
+/// Pushes fill events to shared state.
+async fn run_order_events_subscriber(
+    wss_url: String,
+    batch_auction_addr: Address,
+    mm_address: Address,
+    shared_state: Arc<Mutex<EventState>>,
+    quoter_orders: Arc<Mutex<HashMap<u64, quoter::MarketOrders>>>,
+) {
+    loop {
+        match try_subscribe_order_events(
+            &wss_url,
+            batch_auction_addr,
+            mm_address,
+            &shared_state,
+            &quoter_orders,
+        )
+        .await
+        {
+            Ok(()) => {
+                info!("OrderSettled subscriber exited cleanly");
+                break;
+            }
+            Err(e) => {
+                warn!(err = %e, "OrderSettled subscription dropped — reconnecting in 5s");
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+async fn try_subscribe_order_events(
+    wss_url: &str,
+    batch_auction_addr: Address,
+    mm_address: Address,
+    shared_state: &Arc<Mutex<EventState>>,
+    quoter_orders: &Arc<Mutex<HashMap<u64, quoter::MarketOrders>>>,
+) -> Result<()> {
+    let ws = WsConnect::new(wss_url);
+    let provider = ProviderBuilder::new().connect_ws(ws).await
+        .wrap_err("failed to connect WS for OrderSettled")?;
+
+    // Subscribe to OrderSettled filtered by owner (topic2 for indexed address)
+    let settled_filter = Filter::new()
+        .address(batch_auction_addr)
+        .event_signature(BatchAuction::OrderSettled::SIGNATURE_HASH)
+        .topic2(mm_address);
+
+    let settled_sub = provider
+        .subscribe_logs(&settled_filter)
+        .await
+        .wrap_err("failed to subscribe to OrderSettled")?;
+
+    info!("subscribed to OrderSettled events");
+
+    // Subscribe to GtcAutoCancelled filtered by owner (topic2)
+    let gtc_filter = Filter::new()
+        .address(batch_auction_addr)
+        .event_signature(BatchAuction::GtcAutoCancelled::SIGNATURE_HASH)
+        .topic2(mm_address);
+
+    let gtc_sub = provider
+        .subscribe_logs(&gtc_filter)
+        .await
+        .wrap_err("failed to subscribe to GtcAutoCancelled")?;
+
+    info!("subscribed to GtcAutoCancelled events");
+
+    // Subscribe to BatchCleared (no owner filter — all markets)
+    let batch_filter = Filter::new()
+        .address(batch_auction_addr)
+        .event_signature(BatchAuction::BatchCleared::SIGNATURE_HASH);
+
+    let batch_sub = provider
+        .subscribe_logs(&batch_filter)
+        .await
+        .wrap_err("failed to subscribe to BatchCleared")?;
+
+    info!("subscribed to BatchCleared events");
+
+    let mut settled_stream = settled_sub.into_stream();
+    let mut gtc_stream = gtc_sub.into_stream();
+    let mut batch_stream = batch_sub.into_stream();
+
+    use futures_util::StreamExt;
+
+    loop {
+        tokio::select! {
+            Some(log) = settled_stream.next() => {
+                match BatchAuction::OrderSettled::decode_log(&log.inner) {
+                    Ok(event) => {
+                        let order_id = event.orderId;
+                        let filled_lots = event.filledLots.to::<u64>();
+
+                        if filled_lots == 0 {
+                            tracing::debug!(order_id = %order_id, "OrderSettled with 0 lots — skipping");
+                            continue;
+                        }
+
+                        // Look up side and market from quoter active_orders
+                        let orders = quoter_orders.lock().await;
+                        let mut side = "unknown".to_string();
+                        let mut market_id = 0u64;
+                        for (&mid, mo) in orders.iter() {
+                            if mo.bid_order_ids.contains(&order_id) {
+                                side = "bid".to_string();
+                                market_id = mid;
+                                break;
+                            }
+                            if mo.ask_order_ids.contains(&order_id) {
+                                side = "ask".to_string();
+                                market_id = mid;
+                                break;
+                            }
+                        }
+                        drop(orders);
+
+                        if side == "unknown" {
+                            tracing::debug!(
+                                order_id = %order_id,
+                                filled_lots,
+                                "OrderSettled for unknown order — ignoring (likely from previous session)"
+                            );
+                            continue;
+                        }
+
+                        info!(
+                            order_id = %order_id,
+                            market_id,
+                            side,
+                            filled_lots,
+                            "FILL EVENT — OrderSettled"
+                        );
+
+                        shared_state.lock().await.fills.push(FillEvent {
+                            order_id: order_id.to::<u64>(),
+                            market_id,
+                            filled_lots,
+                            side,
+                        });
+                    }
+                    Err(e) => {
+                        warn!(err = %e, "failed to decode OrderSettled event");
+                    }
+                }
+            }
+            Some(log) = gtc_stream.next() => {
+                match BatchAuction::GtcAutoCancelled::decode_log(&log.inner) {
+                    Ok(event) => {
+                        info!(
+                            order_id = %event.orderId,
+                            "GtcAutoCancelled — order auto-cancelled by batch auction"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(err = %e, "failed to decode GtcAutoCancelled event");
+                    }
+                }
+            }
+            Some(log) = batch_stream.next() => {
+                match BatchAuction::BatchCleared::decode_log(&log.inner) {
+                    Ok(event) => {
+                        info!(
+                            market_id = %event.marketId,
+                            batch_id = %event.batchId,
+                            clearing_tick = %event.clearingTick,
+                            matched_lots = %event.matchedLots,
+                            "BatchCleared"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(err = %e, "failed to decode BatchCleared event");
+                    }
+                }
+            }
+            else => {
+                eyre::bail!("all event streams ended");
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -81,6 +391,7 @@ async fn main() -> Result<()> {
     info!(
         dry_run = cli.dry_run,
         rpc = %cfg.rpc.url,
+        wss = cfg.rpc.wss_url.as_deref().unwrap_or("none"),
         "starting strike-mm"
     );
 
@@ -104,6 +415,13 @@ async fn main() -> Result<()> {
     let usdt_addr: Address = cfg.contracts.usdt.parse().wrap_err("bad usdt address")?;
     let redemption_addr: Address = cfg.contracts.redemption.parse().wrap_err("bad redemption address")?;
     let outcome_token_addr: Address = cfg.contracts.outcome_token.parse().wrap_err("bad outcome_token address")?;
+
+    let batch_auction_addr: Option<Address> = cfg.contracts.batch_auction.as_ref()
+        .map(|s| s.parse().wrap_err("bad batch_auction address"))
+        .transpose()?;
+    let market_factory_addr: Option<Address> = cfg.contracts.market_factory.as_ref()
+        .map(|s| s.parse().wrap_err("bad market_factory address"))
+        .transpose()?;
 
     // Approve vault for USDT spending (idempotent)
     if !cli.dry_run {
@@ -191,7 +509,64 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Track previous order states for fill detection
+    // ── Event-Driven State ───────────────────────────────────────────
+    let shared_state = Arc::new(Mutex::new(EventState::default()));
+
+    // Initial market snapshot from indexer (one-time)
+    info!("loading initial market snapshot from indexer");
+    match market_manager::fetch_active_markets(&http_client, &cfg.indexer.url, cfg.quoting.min_expiry_secs).await {
+        Ok(initial_markets) => {
+            let count = initial_markets.len();
+            let mut state = shared_state.lock().await;
+            for m in initial_markets {
+                state.active_markets.insert(m.id as u64, m);
+            }
+            state.initialized = true;
+            info!(count, "initial market snapshot loaded");
+        }
+        Err(e) => {
+            warn!(err = %e, "failed to load initial market snapshot — will rely on events");
+            shared_state.lock().await.initialized = true;
+        }
+    }
+
+    // Shared reference to quoter's active_orders for event subscribers
+    // We share a snapshot that gets updated periodically from the main loop
+    let quoter_orders: Arc<Mutex<HashMap<u64, quoter::MarketOrders>>> =
+        Arc::new(Mutex::new(quoter.active_orders.clone()));
+
+    // Start WS event subscriptions (if wss_url and contract addresses are configured)
+    let ws_enabled = cfg.rpc.wss_url.is_some()
+        && batch_auction_addr.is_some()
+        && market_factory_addr.is_some();
+
+    if ws_enabled {
+        let wss_url = cfg.rpc.wss_url.clone().unwrap();
+
+        // Task A: MarketCreated subscriber
+        let mc_wss = wss_url.clone();
+        let mc_factory = market_factory_addr.unwrap();
+        let mc_state = shared_state.clone();
+        let mc_min_expiry = cfg.quoting.min_expiry_secs;
+        tokio::spawn(async move {
+            run_market_created_subscriber(mc_wss, mc_factory, mc_state, mc_min_expiry).await;
+        });
+
+        // Task B: OrderSettled + GtcAutoCancelled + BatchCleared subscriber
+        let oe_wss = wss_url.clone();
+        let oe_batch = batch_auction_addr.unwrap();
+        let oe_state = shared_state.clone();
+        let oe_orders = quoter_orders.clone();
+        tokio::spawn(async move {
+            run_order_events_subscriber(oe_wss, oe_batch, signer_addr, oe_state, oe_orders).await;
+        });
+
+        info!("WS event subscriptions started");
+    } else {
+        warn!("WS subscriptions disabled — missing wss_url, batch_auction, or market_factory config");
+    }
+
+    // Track previous order states for fill detection (fallback when WS not available)
     let mut prev_order_states: HashMap<i64, IndexerOrder> = HashMap::new();
 
     // Graceful shutdown handler
@@ -264,21 +639,42 @@ async fn main() -> Result<()> {
                     _ => cfg.volatility.fixed_annual_vol,
                 };
 
-                // Fetch active markets from indexer
-                let markets = match market_manager::fetch_active_markets(
-                    &http_client,
-                    &cfg.indexer.url,
-                    cfg.quoting.min_expiry_secs,
-                ).await {
-                    Ok(m) => {
-                        if m.is_empty() {
-                            info!("no active markets with >{} secs to expiry", cfg.quoting.min_expiry_secs);
-                        }
-                        m
+                // ── Market Discovery ─────────────────────────────────
+                let markets = if ws_enabled {
+                    // Read from shared state (populated by WS events + initial snapshot)
+                    let now_secs = (now_ms / 1000) as i64;
+                    let state = shared_state.lock().await;
+                    let active: Vec<market_manager::Market> = state
+                        .active_markets
+                        .values()
+                        .filter(|m| {
+                            m.expiry_time > now_secs + cfg.quoting.min_expiry_secs as i64
+                        })
+                        .cloned()
+                        .collect();
+                    drop(state);
+
+                    if active.is_empty() {
+                        info!("no active markets with >{} secs to expiry", cfg.quoting.min_expiry_secs);
                     }
-                    Err(e) => {
-                        warn!(err = %e, "failed to fetch markets — skipping cycle");
-                        continue;
+                    active
+                } else {
+                    // Fallback: poll indexer
+                    match market_manager::fetch_active_markets(
+                        &http_client,
+                        &cfg.indexer.url,
+                        cfg.quoting.min_expiry_secs,
+                    ).await {
+                        Ok(m) => {
+                            if m.is_empty() {
+                                info!("no active markets with >{} secs to expiry", cfg.quoting.min_expiry_secs);
+                            }
+                            m
+                        }
+                        Err(e) => {
+                            warn!(err = %e, "failed to fetch markets — skipping cycle");
+                            continue;
+                        }
                     }
                 };
 
@@ -296,49 +692,76 @@ async fn main() -> Result<()> {
                     );
                 }
 
-                // Cancel orders on expired markets
+                // Cancel orders on expired markets and clean up shared state
                 for market_id in &expired_markets {
                     info!(market_id, "MARKET EXPIRED — cancelling all orders");
                     quoter.cancel_local_orders(*market_id).await?;
                     let final_pos = risk_mgr.position(*market_id);
                     info!(market_id, final_position = final_pos, "final position on expired market");
                     risk_mgr.remove_market(*market_id);
+
+                    // Remove from shared state
+                    if ws_enabled {
+                        shared_state.lock().await.active_markets.remove(market_id);
+                    }
                 }
 
-                // Poll positions for fill tracking
-                match fetch_positions(&http_client, &cfg.indexer.url, &mm_address).await {
-                    Ok(orders) => {
-                        let mut new_states: HashMap<i64, IndexerOrder> = HashMap::new();
-                        for order in &orders {
-                            // Detect transitions to filled
-                            if order.status == "filled" {
-                                if let Some(prev) = prev_order_states.get(&order.id) {
-                                    if prev.status != "filled" {
-                                        let sign: i64 = if order.side == "bid" { 1 } else { -1 };
-                                        let lots = order.lots as i64 * sign;
-                                        info!(
-                                            order_id = order.id,
-                                            market_id = order.market_id,
-                                            side = %order.side,
-                                            tick = order.tick,
-                                            lots = order.lots,
-                                            signed_lots = lots,
-                                            "FILL DETECTED — position updated"
-                                        );
-                                        risk_mgr.record_fill(order.market_id as u64, lots);
+                // ── Fill Detection ───────────────────────────────────
+                if ws_enabled {
+                    // Drain fills from shared state (populated by WS events)
+                    let mut state = shared_state.lock().await;
+                    let pending_fills: Vec<FillEvent> = state.fills.drain(..).collect();
+                    drop(state);
+
+                    for fill in &pending_fills {
+                        let sign: i64 = if fill.side == "bid" { 1 } else { -1 };
+                        let lots = fill.filled_lots as i64 * sign;
+                        info!(
+                            order_id = fill.order_id,
+                            market_id = fill.market_id,
+                            side = %fill.side,
+                            filled_lots = fill.filled_lots,
+                            signed_lots = lots,
+                            "FILL DETECTED (event) — position updated"
+                        );
+                        risk_mgr.record_fill(fill.market_id, lots);
+                    }
+                } else {
+                    // Fallback: poll indexer for fill tracking
+                    match fetch_positions(&http_client, &cfg.indexer.url, &mm_address).await {
+                        Ok(orders) => {
+                            let mut new_states: HashMap<i64, IndexerOrder> = HashMap::new();
+                            for order in &orders {
+                                // Detect transitions to filled
+                                if order.status == "filled" {
+                                    if let Some(prev) = prev_order_states.get(&order.id) {
+                                        if prev.status != "filled" {
+                                            let sign: i64 = if order.side == "bid" { 1 } else { -1 };
+                                            let lots = order.lots as i64 * sign;
+                                            info!(
+                                                order_id = order.id,
+                                                market_id = order.market_id,
+                                                side = %order.side,
+                                                tick = order.tick,
+                                                lots = order.lots,
+                                                signed_lots = lots,
+                                                "FILL DETECTED — position updated"
+                                            );
+                                            risk_mgr.record_fill(order.market_id as u64, lots);
+                                        }
                                     }
                                 }
+                                new_states.insert(order.id, order.clone());
                             }
-                            new_states.insert(order.id, order.clone());
+                            prev_order_states = new_states;
                         }
-                        prev_order_states = new_states;
-                    }
-                    Err(e) => {
-                        warn!(err = %e, "failed to fetch positions — skipping fill check");
+                        Err(e) => {
+                            warn!(err = %e, "failed to fetch positions — skipping fill check");
+                        }
                     }
                 }
 
-                // Quote on all active markets
+                // ── Quoting ──────────────────────────────────────────
                 let all_active: Vec<market_manager::Market> = markets;
                 for market in &all_active {
                     let market_id = market.id as u64;
@@ -418,6 +841,11 @@ async fn main() -> Result<()> {
                             );
                         }
                     }
+                }
+
+                // Sync quoter active_orders to shared reference for event subscribers
+                if ws_enabled {
+                    *quoter_orders.lock().await = quoter.active_orders.clone();
                 }
             }
         }

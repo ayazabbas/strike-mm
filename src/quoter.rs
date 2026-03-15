@@ -672,6 +672,33 @@ where
     pub fn quoting_markets(&self) -> Vec<u64> {
         self.active_orders.keys().copied().collect()
     }
+
+    /// Look up which side an order was placed on (from active_orders).
+    /// Returns Some("bid") or Some("ask"), or None if order not found.
+    pub fn order_side(&self, order_id: U256) -> Option<&'static str> {
+        for orders in self.active_orders.values() {
+            if orders.bid_order_ids.contains(&order_id) {
+                return Some("bid");
+            }
+            if orders.ask_order_ids.contains(&order_id) {
+                return Some("ask");
+            }
+        }
+        None
+    }
+
+    /// Look up which market an order belongs to (from active_orders).
+    /// Returns Some(market_id) or None if order not found.
+    pub fn order_market(&self, order_id: U256) -> Option<u64> {
+        for (&market_id, orders) in &self.active_orders {
+            if orders.bid_order_ids.contains(&order_id)
+                || orders.ask_order_ids.contains(&order_id)
+            {
+                return Some(market_id);
+            }
+        }
+        None
+    }
 }
 
 /// Approve the Vault contract to spend USDT on behalf of the signer.

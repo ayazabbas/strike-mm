@@ -1,5 +1,6 @@
 [rpc]
 url = "https://bsc-testnet.core.chainstack.com/e602061228197d446d43e62320004d74"
+wss_url = "wss://bsc-testnet.core.chainstack.com/e602061228197d446d43e62320004d74"
 chain_id = 97
 
 [wallet]
@@ -11,6 +12,8 @@ vault = "0xe19bB1799ed8C369980cb346014c68f83df1C294"
 usdt = "0x35c2731E24d88198cDc0128dD42fC2Ee969fB3fa"
 redemption = "0xdBd7dFFEbf8F7a2a3772832D03Ed0a87a57Fb776"
 outcome_token = "0x2C7E4d5b838D61141252b1c4c09618478C561f49"
+batch_auction = "0xF22db29C2Fe828c5F31C6764d042b39419CBD3fd"
+market_factory = "0x4460F2Bc7d4405fc3DBd9344F40D5A0f4a4dF4f0"
 
 [indexer]
 url = "https://app.strike.pm/api"
