@@ -408,6 +408,10 @@ async fn main() -> Result<()> {
         .wallet(wallet)
         .connect_http(cfg.rpc.url.parse().wrap_err("failed to parse RPC URL")?);
 
+    // BSC testnet has sub-1s blocks; alloy defaults to 7s polling which makes
+    // every get_receipt() call needlessly slow.  500ms polls ~2x per block.
+    provider.client().set_poll_interval(std::time::Duration::from_millis(500));
+
     info!(address = %signer_addr, "wallet loaded");
 
     // Parse contract addresses

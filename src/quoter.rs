@@ -310,7 +310,9 @@ where
 
     // ── Phase 3: Sequential Cancel + Quote ────────────────────────────
 
-    /// Place initial quotes for a market via sequential individual placeOrder calls.
+    /// Place initial quotes for a market.  Fires all TXs first (each gets a
+    /// unique nonce from NonceSender), then awaits receipts — so all 4 orders
+    /// hit the mempool within ~1-2 s instead of waiting sequentially.
     pub async fn place_quotes(
         &mut self,
         market_id: u64,
@@ -327,7 +329,11 @@ where
 
         let ns = self.nonce_sender.clone();
 
-        // Place bid levels
+        // ── Phase A: fire all TXs, collect PendingTx handles ─────────
+        // Each entry: (side, tick, PendingTx)
+        let mut pending_txs: Vec<(&str, u64, PendingTx)> = Vec::new();
+
+        // Send bid levels
         for level in 0..self.config.num_levels {
             let tick = bid_tick.saturating_sub(level * 2);
             if tick < 1 { continue; }
@@ -346,28 +352,8 @@ where
                 ns.lock().await.send(tx),
             ).await {
                 Ok(Ok(pending)) => {
-                    let pending: PendingTx = pending;
-                    let tx_hash = *pending.tx_hash();
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(30),
-                        pending.get_receipt(),
-                    ).await {
-                        Ok(Ok(receipt)) => {
-                            let ids = parse_order_ids_from_receipt(&receipt);
-                            info!(
-                                market_id, side = "bid", tick,
-                                tx = %tx_hash, gas_used = receipt.gas_used,
-                                order_ids = ?ids, "bid placed"
-                            );
-                            bid_order_ids.extend(ids);
-                        }
-                        Ok(Err(e)) => {
-                            warn!(market_id, side = "bid", tick, tx = %tx_hash, err = %e, "place receipt error");
-                        }
-                        Err(_) => {
-                            warn!(market_id, side = "bid", tick, tx = %tx_hash, "place receipt timed out");
-                        }
-                    }
+                    info!(market_id, side = "bid", tick, tx = %pending.tx_hash(), "bid tx sent");
+                    pending_txs.push(("bid", tick, pending));
                 }
                 Ok(Err(e)) => {
                     warn!(market_id, side = "bid", tick, err = %e, "place send failed — aborting remaining bids");
@@ -379,7 +365,7 @@ where
             }
         }
 
-        // Place ask levels
+        // Send ask levels
         for level in 0..self.config.num_levels {
             let tick = ask_tick.saturating_add(level * 2);
             if tick > 99 { continue; }
@@ -398,28 +384,8 @@ where
                 ns.lock().await.send(tx),
             ).await {
                 Ok(Ok(pending)) => {
-                    let pending: PendingTx = pending;
-                    let tx_hash = *pending.tx_hash();
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(30),
-                        pending.get_receipt(),
-                    ).await {
-                        Ok(Ok(receipt)) => {
-                            let ids = parse_order_ids_from_receipt(&receipt);
-                            info!(
-                                market_id, side = "ask", tick,
-                                tx = %tx_hash, gas_used = receipt.gas_used,
-                                order_ids = ?ids, "ask placed"
-                            );
-                            ask_order_ids.extend(ids);
-                        }
-                        Ok(Err(e)) => {
-                            warn!(market_id, side = "ask", tick, tx = %tx_hash, err = %e, "place receipt error");
-                        }
-                        Err(_) => {
-                            warn!(market_id, side = "ask", tick, tx = %tx_hash, "place receipt timed out");
-                        }
-                    }
+                    info!(market_id, side = "ask", tick, tx = %pending.tx_hash(), "ask tx sent");
+                    pending_txs.push(("ask", tick, pending));
                 }
                 Ok(Err(e)) => {
                     warn!(market_id, side = "ask", tick, err = %e, "place send failed — aborting remaining asks");
@@ -427,6 +393,35 @@ where
                 }
                 Err(_) => {
                     warn!(market_id, side = "ask", tick, "place send timed out");
+                }
+            }
+        }
+
+        // ── Phase B: await all receipts ──────────────────────────────
+        for (side, tick, pending) in pending_txs {
+            let tx_hash = *pending.tx_hash();
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                pending.get_receipt(),
+            ).await {
+                Ok(Ok(receipt)) => {
+                    let ids = parse_order_ids_from_receipt(&receipt);
+                    info!(
+                        market_id, side, tick,
+                        tx = %tx_hash, gas_used = receipt.gas_used,
+                        order_ids = ?ids, "order confirmed"
+                    );
+                    if side == "bid" {
+                        bid_order_ids.extend(ids);
+                    } else {
+                        ask_order_ids.extend(ids);
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!(market_id, side, tick, tx = %tx_hash, err = %e, "place receipt error");
+                }
+                Err(_) => {
+                    warn!(market_id, side, tick, tx = %tx_hash, "place receipt timed out");
                 }
             }
         }
