@@ -203,14 +203,19 @@ async fn run_order_events_subscriber(
     mm_address: Address,
     shared_state: Arc<Mutex<EventState>>,
     quoter_orders: Arc<Mutex<HashMap<u64, quoter::MarketOrders>>>,
+    sub_ready: Arc<tokio::sync::Notify>,
 ) {
+    let mut first_connect = true;
     loop {
+        let ready_signal = if first_connect { Some(sub_ready.clone()) } else { None };
+        first_connect = false;
         match try_subscribe_order_events(
             &wss_url,
             batch_auction_addr,
             mm_address,
             &shared_state,
             &quoter_orders,
+            ready_signal,
         )
         .await
         {
@@ -232,6 +237,7 @@ async fn try_subscribe_order_events(
     mm_address: Address,
     shared_state: &Arc<Mutex<EventState>>,
     quoter_orders: &Arc<Mutex<HashMap<u64, quoter::MarketOrders>>>,
+    sub_ready: Option<Arc<tokio::sync::Notify>>,
 ) -> Result<()> {
     let ws = WsConnect::new(wss_url);
     let provider = ProviderBuilder::new().connect_ws(ws).await
@@ -274,6 +280,12 @@ async fn try_subscribe_order_events(
         .wrap_err("failed to subscribe to BatchCleared")?;
 
     info!("subscribed to BatchCleared events");
+
+    // Signal that all subscriptions are ready — main loop can start quoting
+    if let Some(ready) = sub_ready {
+        ready.notify_one();
+        info!("signalled sub_ready — main loop unblocked");
+    }
 
     let mut settled_stream = settled_sub.into_stream();
     let mut gtc_stream = gtc_sub.into_stream();
@@ -564,15 +576,27 @@ async fn main() -> Result<()> {
         });
 
         // Task B: OrderSettled + GtcAutoCancelled + BatchCleared subscriber
+        let sub_ready = Arc::new(tokio::sync::Notify::new());
         let oe_wss = wss_url.clone();
         let oe_batch = batch_auction_addr.unwrap();
         let oe_state = shared_state.clone();
         let oe_orders = quoter_orders.clone();
+        let oe_ready = sub_ready.clone();
         tokio::spawn(async move {
-            run_order_events_subscriber(oe_wss, oe_batch, signer_addr, oe_state, oe_orders).await;
+            run_order_events_subscriber(oe_wss, oe_batch, signer_addr, oe_state, oe_orders, oe_ready).await;
         });
 
-        info!("WS event subscriptions started");
+        info!("WS event subscriptions started — waiting for BatchCleared sub to be ready");
+
+        // Gate: don't enter main loop until BatchCleared subscription is confirmed
+        tokio::select! {
+            _ = sub_ready.notified() => {
+                info!("BatchCleared subscription ready — proceeding to main loop");
+            }
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(60)) => {
+                warn!("BatchCleared subscription not ready after 60s — proceeding anyway");
+            }
+        }
     } else {
         warn!("WS subscriptions disabled — missing wss_url, batch_auction, or market_factory config");
     }
