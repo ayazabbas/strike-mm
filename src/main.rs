@@ -334,9 +334,9 @@ async fn try_subscribe_all(
                             matched_lots = matched,
                             "BatchCleared"
                         );
-                        // Signal the main loop to re-place orders (batch settled them)
-                        shared_state.lock().await.cleared_markets.insert(market_id);
                         if matched > 0 {
+                            // Only invalidate on actual fills — GTC zero-fill orders roll automatically
+                            shared_state.lock().await.cleared_markets.insert(market_id);
                             fill_notify.notify_one();
                         }
                     }
@@ -775,16 +775,18 @@ async fn main() -> Result<()> {
                 }
 
                 // ── Batch-cleared invalidation ────────────────────────
-                // When a batch clears, our orders get settled on-chain (lots→0).
-                // Remove them from local tracking so we re-place fresh orders.
+                // Only invalidate when there were actual fills (matched_lots > 0).
+                // With GTC orders, zero-fill batches roll orders to the next batch —
+                // no need to re-place. Only fills change the order state.
                 if ws_enabled {
                     let cleared: Vec<u64> = {
                         let mut state = shared_state.lock().await;
                         state.cleared_markets.drain().collect()
                     };
+                    // cleared_markets only contains markets with matched_lots > 0
                     for mid in cleared {
                         if quoter.active_orders.contains_key(&mid) {
-                            tracing::debug!(market_id = mid, "batch cleared — invalidating local orders for re-place");
+                            info!(market_id = mid, "batch filled — invalidating local orders for re-place");
                             quoter.active_orders.remove(&mid);
                         }
                     }

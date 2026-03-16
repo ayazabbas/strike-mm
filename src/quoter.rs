@@ -223,7 +223,7 @@ where
             }
             bid_params.push(OrderBook::OrderParam {
                 side: 0, // Bid
-                orderType: 0, // GTC
+                orderType: 1, // GTC (enum: 0=GTB, 1=GTC)
                 tick: tick as u8,
                 lots,
             });
@@ -238,7 +238,7 @@ where
             }
             ask_params.push(OrderBook::OrderParam {
                 side: 1, // Ask
-                orderType: 0, // GTC
+                orderType: 1, // GTC (enum: 0=GTB, 1=GTC)
                 tick: tick as u8,
                 lots,
             });
