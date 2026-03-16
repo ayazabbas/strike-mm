@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::market_manager::Market;
 
@@ -21,6 +21,10 @@ pub struct EventState {
 
     /// Accumulated fill events since last drain.
     pub fills: Vec<FillEvent>,
+
+    /// Markets that had a batch cleared since last drain.
+    /// The quoter should invalidate its local orders and re-place immediately.
+    pub cleared_markets: HashSet<u64>,
 
     /// True once the initial market snapshot has been loaded.
     pub initialized: bool,

@@ -78,207 +78,105 @@ async fn fetch_positions(
     Ok(resp.open_orders)
 }
 
-// ── WS Event Subscription Tasks ──────────────────────────────────────
+// ── WS Event Subscription Task (single connection) ──────────────────
 
-/// Subscribe to MarketCreated events from MarketFactory.
-/// Adds new BTC/USD markets to shared state.
-async fn run_market_created_subscriber(
+/// All WS subscriptions on a single connection: MarketCreated, OrderSettled,
+/// GtcAutoCancelled, and BatchCleared.
+async fn run_ws_subscriber(
     wss_url: String,
     market_factory_addr: Address,
-    shared_state: Arc<Mutex<EventState>>,
-    min_expiry_secs: u64,
-) {
-    loop {
-        match try_subscribe_market_created(
-            &wss_url,
-            market_factory_addr,
-            &shared_state,
-            min_expiry_secs,
-        )
-        .await
-        {
-            Ok(()) => {
-                info!("MarketCreated subscriber exited cleanly");
-                break;
-            }
-            Err(e) => {
-                warn!(err = %e, "MarketCreated subscription dropped — reconnecting in 5s");
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            }
-        }
-    }
-}
-
-async fn try_subscribe_market_created(
-    wss_url: &str,
-    market_factory_addr: Address,
-    shared_state: &Arc<Mutex<EventState>>,
-    min_expiry_secs: u64,
-) -> Result<()> {
-    let ws = WsConnect::new(wss_url);
-    let provider = ProviderBuilder::new().connect_ws(ws).await
-        .wrap_err("failed to connect WS for MarketCreated")?;
-
-    let filter = Filter::new()
-        .address(market_factory_addr)
-        .event_signature(MarketFactory::MarketCreated::SIGNATURE_HASH);
-
-    let sub = provider
-        .subscribe_logs(&filter)
-        .await
-        .wrap_err("failed to subscribe to MarketCreated")?;
-
-    info!("subscribed to MarketCreated events");
-
-    let mut stream = sub.into_stream();
-    use futures_util::StreamExt;
-
-    while let Some(log) = stream.next().await {
-        match MarketFactory::MarketCreated::decode_log(&log.inner) {
-            Ok(event) => {
-                let price_id = format!("0x{}", alloy::hex::encode(event.priceId));
-                let order_book_market_id = event.orderBookMarketId.to::<u64>();
-                let strike_price = event.strikePrice;
-                let expiry_time = event.expiryTime.to::<i64>();
-
-                // Filter: only BTC/USD markets
-                if price_id != BTC_USD_PRICE_ID {
-                    tracing::debug!(
-                        order_book_market_id,
-                        price_id,
-                        "ignoring non-BTC/USD MarketCreated"
-                    );
-                    continue;
-                }
-
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64;
-
-                if expiry_time <= now + min_expiry_secs as i64 {
-                    tracing::debug!(
-                        order_book_market_id,
-                        expiry_time,
-                        "ignoring MarketCreated — too close to expiry"
-                    );
-                    continue;
-                }
-
-                let market = market_manager::Market {
-                    id: order_book_market_id as i64,
-                    expiry_time,
-                    status: "active".to_string(),
-                    pyth_feed_id: Some(price_id),
-                    strike_price: Some(strike_price),
-                    batch_interval: 3, // default; not in event
-                };
-
-                info!(
-                    order_book_market_id,
-                    strike_price,
-                    expiry_time,
-                    "MarketCreated event — new BTC/USD market discovered"
-                );
-
-                shared_state.lock().await.active_markets.insert(
-                    order_book_market_id,
-                    market,
-                );
-            }
-            Err(e) => {
-                warn!(err = %e, "failed to decode MarketCreated event");
-            }
-        }
-    }
-
-    eyre::bail!("MarketCreated stream ended")
-}
-
-/// Subscribe to OrderSettled and GtcAutoCancelled events from BatchAuction.
-/// Pushes fill events to shared state.
-async fn run_order_events_subscriber(
-    wss_url: String,
     batch_auction_addr: Address,
     mm_address: Address,
     shared_state: Arc<Mutex<EventState>>,
     quoter_orders: Arc<Mutex<HashMap<u64, quoter::MarketOrders>>>,
     sub_ready: Arc<tokio::sync::Notify>,
+    fill_notify: Arc<tokio::sync::Notify>,
+    min_expiry_secs: u64,
 ) {
     let mut first_connect = true;
     loop {
         let ready_signal = if first_connect { Some(sub_ready.clone()) } else { None };
         first_connect = false;
-        match try_subscribe_order_events(
+        match try_subscribe_all(
             &wss_url,
+            market_factory_addr,
             batch_auction_addr,
             mm_address,
             &shared_state,
             &quoter_orders,
             ready_signal,
+            &fill_notify,
+            min_expiry_secs,
         )
         .await
         {
             Ok(()) => {
-                info!("OrderSettled subscriber exited cleanly");
+                info!("WS subscriber exited cleanly");
                 break;
             }
             Err(e) => {
-                warn!(err = %e, "OrderSettled subscription dropped — reconnecting in 5s");
+                warn!(err = %e, "WS subscription dropped — reconnecting in 5s");
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
         }
     }
 }
 
-async fn try_subscribe_order_events(
+async fn try_subscribe_all(
     wss_url: &str,
+    market_factory_addr: Address,
     batch_auction_addr: Address,
     mm_address: Address,
     shared_state: &Arc<Mutex<EventState>>,
     quoter_orders: &Arc<Mutex<HashMap<u64, quoter::MarketOrders>>>,
     sub_ready: Option<Arc<tokio::sync::Notify>>,
+    fill_notify: &Arc<tokio::sync::Notify>,
+    min_expiry_secs: u64,
 ) -> Result<()> {
     let ws = WsConnect::new(wss_url);
     let provider = ProviderBuilder::new().connect_ws(ws).await
-        .wrap_err("failed to connect WS for OrderSettled")?;
+        .wrap_err("failed to connect WS")?;
 
-    // Subscribe to OrderSettled filtered by owner (topic2 for indexed address)
+    // MarketCreated from MarketFactory
+    let mc_filter = Filter::new()
+        .address(market_factory_addr)
+        .event_signature(MarketFactory::MarketCreated::SIGNATURE_HASH);
+    let mc_sub = provider
+        .subscribe_logs(&mc_filter)
+        .await
+        .wrap_err("failed to subscribe to MarketCreated")?;
+    info!("subscribed to MarketCreated events");
+
+    // OrderSettled filtered by owner (topic2)
     let settled_filter = Filter::new()
         .address(batch_auction_addr)
         .event_signature(BatchAuction::OrderSettled::SIGNATURE_HASH)
         .topic2(mm_address);
-
     let settled_sub = provider
         .subscribe_logs(&settled_filter)
         .await
         .wrap_err("failed to subscribe to OrderSettled")?;
-
     info!("subscribed to OrderSettled events");
 
-    // Subscribe to GtcAutoCancelled filtered by owner (topic2)
+    // GtcAutoCancelled filtered by owner (topic2)
     let gtc_filter = Filter::new()
         .address(batch_auction_addr)
         .event_signature(BatchAuction::GtcAutoCancelled::SIGNATURE_HASH)
         .topic2(mm_address);
-
     let gtc_sub = provider
         .subscribe_logs(&gtc_filter)
         .await
         .wrap_err("failed to subscribe to GtcAutoCancelled")?;
-
     info!("subscribed to GtcAutoCancelled events");
 
-    // Subscribe to BatchCleared (no owner filter — all markets)
+    // BatchCleared (no owner filter — all markets)
     let batch_filter = Filter::new()
         .address(batch_auction_addr)
         .event_signature(BatchAuction::BatchCleared::SIGNATURE_HASH);
-
     let batch_sub = provider
         .subscribe_logs(&batch_filter)
         .await
         .wrap_err("failed to subscribe to BatchCleared")?;
-
     info!("subscribed to BatchCleared events");
 
     // Signal that all subscriptions are ready — main loop can start quoting
@@ -287,6 +185,7 @@ async fn try_subscribe_order_events(
         info!("signalled sub_ready — main loop unblocked");
     }
 
+    let mut mc_stream = mc_sub.into_stream();
     let mut settled_stream = settled_sub.into_stream();
     let mut gtc_stream = gtc_sub.into_stream();
     let mut batch_stream = batch_sub.into_stream();
@@ -295,6 +194,63 @@ async fn try_subscribe_order_events(
 
     loop {
         tokio::select! {
+            Some(log) = mc_stream.next() => {
+                match MarketFactory::MarketCreated::decode_log(&log.inner) {
+                    Ok(event) => {
+                        let price_id = format!("0x{}", alloy::hex::encode(event.priceId));
+                        let order_book_market_id = event.orderBookMarketId.to::<u64>();
+                        let strike_price = event.strikePrice;
+                        let expiry_time = event.expiryTime.to::<i64>();
+
+                        if price_id != BTC_USD_PRICE_ID {
+                            tracing::debug!(
+                                order_book_market_id,
+                                price_id,
+                                "ignoring non-BTC/USD MarketCreated"
+                            );
+                            continue;
+                        }
+
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs() as i64;
+
+                        if expiry_time <= now + min_expiry_secs as i64 {
+                            tracing::debug!(
+                                order_book_market_id,
+                                expiry_time,
+                                "ignoring MarketCreated — too close to expiry"
+                            );
+                            continue;
+                        }
+
+                        let market = market_manager::Market {
+                            id: order_book_market_id as i64,
+                            expiry_time,
+                            status: "active".to_string(),
+                            pyth_feed_id: Some(price_id),
+                            strike_price: Some(strike_price),
+                            batch_interval: 3,
+                        };
+
+                        info!(
+                            order_book_market_id,
+                            strike_price,
+                            expiry_time,
+                            "MarketCreated event — new BTC/USD market discovered"
+                        );
+
+                        shared_state.lock().await.active_markets.insert(
+                            order_book_market_id,
+                            market,
+                        );
+                    }
+                    Err(e) => {
+                        warn!(err = %e, "failed to decode MarketCreated event");
+                    }
+                }
+            }
             Some(log) = settled_stream.next() => {
                 match BatchAuction::OrderSettled::decode_log(&log.inner) {
                     Ok(event) => {
@@ -306,7 +262,6 @@ async fn try_subscribe_order_events(
                             continue;
                         }
 
-                        // Look up side and market from quoter active_orders
                         let orders = quoter_orders.lock().await;
                         let mut side = "unknown".to_string();
                         let mut market_id = 0u64;
@@ -347,6 +302,7 @@ async fn try_subscribe_order_events(
                             filled_lots,
                             side,
                         });
+                        fill_notify.notify_one();
                     }
                     Err(e) => {
                         warn!(err = %e, "failed to decode OrderSettled event");
@@ -369,13 +325,20 @@ async fn try_subscribe_order_events(
             Some(log) = batch_stream.next() => {
                 match BatchAuction::BatchCleared::decode_log(&log.inner) {
                     Ok(event) => {
+                        let market_id = event.marketId.to::<u64>();
+                        let matched = event.matchedLots.to::<u64>();
                         info!(
                             market_id = %event.marketId,
                             batch_id = %event.batchId,
                             clearing_tick = %event.clearingTick,
-                            matched_lots = %event.matchedLots,
+                            matched_lots = matched,
                             "BatchCleared"
                         );
+                        // Signal the main loop to re-place orders (batch settled them)
+                        shared_state.lock().await.cleared_markets.insert(market_id);
+                        if matched > 0 {
+                            fill_notify.notify_one();
+                        }
                     }
                     Err(e) => {
                         warn!(err = %e, "failed to decode BatchCleared event");
@@ -445,8 +408,7 @@ async fn main() -> Result<()> {
         quoter::approve_vault(usdt_addr, vault_addr, signer_addr, provider.clone()).await?;
     }
 
-    // Wait for approval to mine, then sync nonce
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    // No sleep needed — NonceSender fetches nonce from chain after any pending TX confirms
 
     // Shared state
     let (price_tx, price_rx) = watch::channel(None);
@@ -563,30 +525,30 @@ async fn main() -> Result<()> {
         && batch_auction_addr.is_some()
         && market_factory_addr.is_some();
 
+    // fill_notify: event subscriber signals this on fills/matches so main loop wakes immediately
+    let fill_notify: Option<Arc<tokio::sync::Notify>> = if ws_enabled { Some(Arc::new(tokio::sync::Notify::new())) } else { None };
+
     if ws_enabled {
         let wss_url = cfg.rpc.wss_url.clone().unwrap();
 
-        // Task A: MarketCreated subscriber
-        let mc_wss = wss_url.clone();
-        let mc_factory = market_factory_addr.unwrap();
-        let mc_state = shared_state.clone();
-        let mc_min_expiry = cfg.quoting.min_expiry_secs;
-        tokio::spawn(async move {
-            run_market_created_subscriber(mc_wss, mc_factory, mc_state, mc_min_expiry).await;
-        });
-
-        // Task B: OrderSettled + GtcAutoCancelled + BatchCleared subscriber
+        // Single WS connection for all subscriptions
         let sub_ready = Arc::new(tokio::sync::Notify::new());
-        let oe_wss = wss_url.clone();
-        let oe_batch = batch_auction_addr.unwrap();
-        let oe_state = shared_state.clone();
-        let oe_orders = quoter_orders.clone();
-        let oe_ready = sub_ready.clone();
+        let ws_wss = wss_url.clone();
+        let ws_factory = market_factory_addr.unwrap();
+        let ws_batch = batch_auction_addr.unwrap();
+        let ws_state = shared_state.clone();
+        let ws_orders = quoter_orders.clone();
+        let ws_ready = sub_ready.clone();
+        let ws_fill = fill_notify.clone().unwrap();
+        let ws_min_expiry = cfg.quoting.min_expiry_secs;
         tokio::spawn(async move {
-            run_order_events_subscriber(oe_wss, oe_batch, signer_addr, oe_state, oe_orders, oe_ready).await;
+            run_ws_subscriber(
+                ws_wss, ws_factory, ws_batch, signer_addr,
+                ws_state, ws_orders, ws_ready, ws_fill, ws_min_expiry,
+            ).await;
         });
 
-        info!("WS event subscriptions started — waiting for BatchCleared sub to be ready");
+        info!("WS event subscriptions started — waiting for subs to be ready");
 
         // Gate: don't enter main loop until BatchCleared subscription is confirmed
         tokio::select! {
@@ -619,6 +581,7 @@ async fn main() -> Result<()> {
     let mut interval = tokio::time::interval(poll_interval);
 
     loop {
+        // Wait for next wake: interval tick, fill event, or shutdown
         tokio::select! {
             _ = &mut shutdown_rx => {
                 info!("shutting down — cancelling all orders");
@@ -626,7 +589,20 @@ async fn main() -> Result<()> {
                 info!("all orders cancelled, exiting");
                 return Ok(());
             }
+            _ = async {
+                match &fill_notify {
+                    Some(n) => n.notified().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // A fill or matched batch just happened — fall through to quoting
+            }
             _ = interval.tick() => {
+                // Normal poll cycle — fall through to quoting
+            }
+        };
+
+        {
                 // Check for stale Binance data
                 let price_data = price_rx.borrow().clone();
                 let now_ms = std::time::SystemTime::now()
@@ -798,6 +774,22 @@ async fn main() -> Result<()> {
                     }
                 }
 
+                // ── Batch-cleared invalidation ────────────────────────
+                // When a batch clears, our orders get settled on-chain (lots→0).
+                // Remove them from local tracking so we re-place fresh orders.
+                if ws_enabled {
+                    let cleared: Vec<u64> = {
+                        let mut state = shared_state.lock().await;
+                        state.cleared_markets.drain().collect()
+                    };
+                    for mid in cleared {
+                        if quoter.active_orders.contains_key(&mid) {
+                            tracing::debug!(market_id = mid, "batch cleared — invalidating local orders for re-place");
+                            quoter.active_orders.remove(&mid);
+                        }
+                    }
+                }
+
                 // ── Quoting ──────────────────────────────────────────
                 let all_active: Vec<market_manager::Market> = markets;
                 for market in &all_active {
@@ -820,16 +812,8 @@ async fn main() -> Result<()> {
                     let fair = pricing::fair_value(btc_price, strike, vol, tte);
                     let fair_tick = (fair * 100.0).round() as i64;
 
-                    // Skip quoting at extremes — no edge, only risk
-                    if fair_tick <= 2 || fair_tick >= 98 {
-                        if quoter.is_quoting(market_id) {
-                            info!(market_id, fair_tick, secs_left, "PULLING QUOTES — fair at extreme");
-                            if !quoter.cancel_local_orders_batch(market_id).await? {
-                                quoter.cancel_local_orders(market_id).await?;
-                            }
-                        }
-                        continue;
-                    }
+                    // Clamp fair_tick to valid range (ticks 1-99)
+                    let fair_tick = fair_tick.clamp(1, 99);
 
                     let position = risk_mgr.position(market_id);
                     let skew = risk_mgr.inventory_skew(market_id, cfg.quoting.spread_ticks as i64);
@@ -863,6 +847,10 @@ async fn main() -> Result<()> {
                         quoter
                             .requote(market_id, bid_tick, ask_tick, fair_tick, &mut risk_mgr)
                             .await?;
+                        // Sync immediately so event subscriber can look up new order IDs
+                        if ws_enabled {
+                            *quoter_orders.lock().await = quoter.active_orders.clone();
+                        }
                     } else {
                         // Log why we didn't requote (at debug level to avoid spam)
                         if let Some(orders) = quoter.active_orders.get(&market_id) {
@@ -886,7 +874,6 @@ async fn main() -> Result<()> {
                 if ws_enabled {
                     *quoter_orders.lock().await = quoter.active_orders.clone();
                 }
-            }
         }
     }
 }

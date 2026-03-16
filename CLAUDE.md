@@ -24,14 +24,23 @@ indexer API → market_manager.rs ──────→ pricing.rs → quoter.rs
 - **`risk.rs`** — Position tracking per market, per-market and total exposure limits, inventory skew calculation.
 - **`main.rs`** — CLI args, component wiring, main loop (poll markets → compute fair values → requote). Handles graceful shutdown (SIGTERM → cancel all orders).
 
-### Contract Interaction
+### Contract Interaction (V8)
 
 Uses `alloy` v1 with `sol!` macro to generate type-safe contract bindings from ABI JSON files in `abi/`.
 
-- **placeOrder(marketId, side, orderType, tick, lots)** — side: 0=Bid, 1=Ask, 2=SellYes, 3=SellNo; orderType: 0=GTC, 1=GTB; tick: 1-99; lots: count
-- **NOTE V7**: orderType is now 3rd param (was 4th in V4/V5/V6)
-- **cancelOrder(orderId)** — cancels a specific order
-- On startup, approves Vault for max USDT spend
+**Batch operations (primary path):**
+- **`placeOrders(marketId, OrderParam[] params)`** → `uint256[] orderIds` — places multiple orders in a single TX
+- **`replaceOrders(uint256[] cancelIds, marketId, OrderParam[] params)`** → `uint256[] newOrderIds` — atomic cancel+place in one TX, zero empty book time
+- **`OrderParam` struct**: `(Side side, OrderType orderType, uint8 tick, uint64 lots)`
+- Side enum: 0=Bid, 1=Ask, 2=SellYes, 3=SellNo. OrderType: 0=GTC, 1=GTB
+
+**Single-order operations (shutdown/cleanup only):**
+- **`cancelOrder(orderId)`** / **`cancelOrders(uint256[] orderIds)`** — used for shutdown cancel sweep
+- **`placeOrder(marketId, side, orderType, tick, lots)`** — legacy single-order placement
+
+**Architecture note:** Requotes use `replaceOrders` for atomic cancel+place (1 TX), eliminating empty book time. `replaceOrders` also benefits from net settlement — when ticks barely change, minimal ERC20 transfers occur.
+
+On startup, approves Vault for max USDT spend.
 
 ### Indexer API
 
@@ -56,6 +65,6 @@ cargo run -- --dry-run  # Dry run (no txs)
 ## Important Details
 
 - Strike prices from the indexer are in Pyth format (8 decimals) — `pricing::pyth_price_to_f64()` converts them.
-- Markets are short-lived (5 minutes). The bot polls every 5 seconds to discover new ones.
+- Markets are short-lived (5 minutes). The bot polls every 1 second to discover new ones.
 - The bot uses GTC (Good Til Cancel) orders so they persist across batch clearings.
 - Collateral: Bid at tick T for L lots locks `L * T / 100` USDT. Ask locks `L * (100-T) / 100` USDT.

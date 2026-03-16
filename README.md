@@ -8,7 +8,7 @@ A simple liquidity bot for Strike prediction markets on BSC testnet. Provides ba
 2. Polls Strike indexer API for active BTC/USD markets
 3. Computes fair value for each market using Black-Scholes: `P(YES) = Φ((ln(S/K) + σ²t/2) / (σ√t))`
 4. Quotes bid/ask with a configurable spread around fair value
-5. Requotes when BTC price moves enough to shift fair value by ≥ threshold ticks
+5. Requotes atomically via `replaceOrders` (cancel old + place new in single TX) — zero empty book time
 6. Automatically discovers new markets and stops quoting expired ones
 
 ## Quick Start
