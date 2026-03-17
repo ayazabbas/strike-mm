@@ -774,20 +774,22 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // ── Batch-cleared invalidation ────────────────────────
-                // Only invalidate when there were actual fills (matched_lots > 0).
-                // With GTC orders, zero-fill batches roll orders to the next batch —
-                // no need to re-place. Only fills change the order state.
+                // ── Batch-filled: force requote ──────────────────────
+                // When a batch has fills, our orders' lots changed on-chain.
+                // Force a requote (replaceOrders) to cancel stale orders and
+                // place fresh ones. Do NOT remove active_orders — we need the
+                // IDs so replaceOrders can cancel them properly. Otherwise
+                // placeOrders leaves old GTC orders alive and they can self-cross.
                 if ws_enabled {
                     let cleared: Vec<u64> = {
                         let mut state = shared_state.lock().await;
                         state.cleared_markets.drain().collect()
                     };
-                    // cleared_markets only contains markets with matched_lots > 0
                     for mid in cleared {
-                        if quoter.active_orders.contains_key(&mid) {
-                            info!(market_id = mid, "batch filled — invalidating local orders for re-place");
-                            quoter.active_orders.remove(&mid);
+                        if let Some(orders) = quoter.active_orders.get_mut(&mid) {
+                            info!(market_id = mid, "batch filled — forcing requote");
+                            // Reset last_fair_tick to force needs_requote() = true
+                            orders.last_fair_tick = -1;
                         }
                     }
                 }
