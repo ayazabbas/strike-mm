@@ -813,17 +813,6 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    // Improvement #2: Stop quoting entirely near expiry
-                    if (secs_left as u64) <= cfg.quoting.min_quote_secs {
-                        if quoter.is_quoting(market_id) {
-                            info!(market_id, secs_left, min_quote_secs = cfg.quoting.min_quote_secs,
-                                "too close to expiry — cancelling all orders");
-                            if !quoter.cancel_local_orders_batch(market_id).await? {
-                                quoter.cancel_local_orders(market_id).await?;
-                            }
-                        }
-                        continue;
-                    }
 
                     let fair = pricing::fair_value(btc_price, strike, vol, tte);
                     let fair_tick = (fair * 100.0).round() as i64;
