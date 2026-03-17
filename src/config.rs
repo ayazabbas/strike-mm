@@ -50,7 +50,24 @@ pub struct QuotingConfig {
     pub requote_cents: u64,
     pub requote_cooldown_secs: u64,
     pub min_expiry_secs: u64,
+    /// Go one-sided when fair prob exceeds this (or is below 1 - this)
+    #[serde(default = "default_one_sided_threshold")]
+    pub one_sided_threshold: f64,
+    /// Spread multiplier when <120s to expiry
+    #[serde(default = "default_spread_mult_120")]
+    pub expiry_spread_multiplier_120s: f64,
+    /// Spread multiplier when <60s to expiry
+    #[serde(default = "default_spread_mult_60")]
+    pub expiry_spread_multiplier_60s: f64,
+    /// Stop quoting entirely below this many seconds to expiry
+    #[serde(default = "default_min_quote_secs")]
+    pub min_quote_secs: u64,
 }
+
+fn default_one_sided_threshold() -> f64 { 0.90 }
+fn default_spread_mult_120() -> f64 { 1.5 }
+fn default_spread_mult_60() -> f64 { 2.0 }
+fn default_min_quote_secs() -> u64 { 30 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RiskConfig {

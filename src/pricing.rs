@@ -25,8 +25,8 @@ pub fn fair_value(spot: f64, strike: f64, vol: f64, time_to_expiry: f64) -> f64 
     let normal = Normal::new(0.0, 1.0).unwrap();
     let p = normal.cdf(d);
 
-    // Clamp to [0.01, 0.99] — we never want to quote at 0 or 100
-    p.clamp(0.01, 0.99)
+    // Clamp to [0.001, 0.999] — allow extreme probabilities near expiry
+    p.clamp(0.001, 0.999)
 }
 
 /// Compute bid and ask ticks from fair value probability.

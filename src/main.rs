@@ -813,20 +813,76 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
+                    // Improvement #2: Stop quoting entirely near expiry
+                    if (secs_left as u64) <= cfg.quoting.min_quote_secs {
+                        if quoter.is_quoting(market_id) {
+                            info!(market_id, secs_left, min_quote_secs = cfg.quoting.min_quote_secs,
+                                "too close to expiry — cancelling all orders");
+                            if !quoter.cancel_local_orders_batch(market_id).await? {
+                                quoter.cancel_local_orders(market_id).await?;
+                            }
+                        }
+                        continue;
+                    }
+
                     let fair = pricing::fair_value(btc_price, strike, vol, tte);
                     let fair_tick = (fair * 100.0).round() as i64;
 
                     // Clamp fair_tick to valid range (ticks 1-99)
                     let fair_tick = fair_tick.clamp(1, 99);
 
-                    let position = risk_mgr.position(market_id);
-                    let skew = risk_mgr.inventory_skew(market_id, cfg.quoting.spread_ticks as i64);
-                    let (bid_tick, ask_tick) =
-                        pricing::compute_ticks(fair, cfg.quoting.spread_ticks, skew);
+                    // Improvement #2: Time-decay spread widening
+                    let spread_multiplier = if secs_left <= 60 {
+                        cfg.quoting.expiry_spread_multiplier_60s
+                    } else if secs_left <= 120 {
+                        cfg.quoting.expiry_spread_multiplier_120s
+                    } else {
+                        1.0
+                    };
+                    let effective_spread = ((cfg.quoting.spread_ticks as f64 * spread_multiplier).round() as u64).max(2);
 
-                    if quoter.needs_requote(market_id, fair_tick) {
+                    // Improvement #4: Size reduction near expiry
+                    let lots_scale = if secs_left <= 60 {
+                        0.25
+                    } else if secs_left <= 120 {
+                        0.50
+                    } else {
+                        1.0
+                    };
+                    let effective_lots = ((cfg.quoting.lots_per_level as f64 * lots_scale).round() as u64).max(1);
+
+                    // Improvement #1: One-sided quoting
+                    let quote_mode = if fair > cfg.quoting.one_sided_threshold {
+                        quoter::QuoteMode::BidsOnly
+                    } else if fair < (1.0 - cfg.quoting.one_sided_threshold) {
+                        quoter::QuoteMode::AsksOnly
+                    } else {
+                        quoter::QuoteMode::TwoSided
+                    };
+
+                    let position = risk_mgr.position(market_id);
+                    let skew = risk_mgr.inventory_skew(market_id, effective_spread as i64);
+                    let (bid_tick, ask_tick) =
+                        pricing::compute_ticks(fair, effective_spread, skew);
+
+                    // Force requote when quote mode changes
+                    let mode_changed = if let Some(orders) = quoter.active_orders.get(&market_id) {
+                        let prev_had_bids = !orders.bid_order_ids.is_empty();
+                        let prev_had_asks = !orders.ask_order_ids.is_empty();
+                        match quote_mode {
+                            quoter::QuoteMode::BidsOnly => prev_had_asks,
+                            quoter::QuoteMode::AsksOnly => prev_had_bids,
+                            quoter::QuoteMode::TwoSided => !prev_had_bids || !prev_had_asks,
+                        }
+                    } else {
+                        false
+                    };
+
+                    if quoter.needs_requote(market_id, fair_tick) || mode_changed {
                         let reason = if !quoter.is_quoting(market_id) {
                             "initial quote"
+                        } else if mode_changed {
+                            "quote mode changed"
                         } else {
                             "fair value moved >= requote threshold"
                         };
@@ -845,11 +901,15 @@ async fn main() -> Result<()> {
                             bid_tick,
                             ask_tick,
                             spread = ask_tick as i64 - bid_tick as i64,
+                            effective_spread,
+                            spread_multiplier = format!("{spread_multiplier:.1}"),
+                            quote_mode = ?quote_mode,
+                            effective_lots,
                             price_age_ms,
                             "REQUOTING"
                         );
                         quoter
-                            .requote(market_id, bid_tick, ask_tick, fair_tick, &mut risk_mgr)
+                            .requote(market_id, bid_tick, ask_tick, fair_tick, &mut risk_mgr, quote_mode, effective_lots)
                             .await?;
                         // Sync immediately so event subscriber can look up new order IDs
                         if ws_enabled {

@@ -26,6 +26,10 @@ num_levels = 2
 requote_cents = 10
 requote_cooldown_secs = 5
 min_expiry_secs = 5
+one_sided_threshold = 0.90
+expiry_spread_multiplier_120s = 1.5
+expiry_spread_multiplier_60s = 2.0
+min_quote_secs = 30
 
 [risk]
 max_position_per_market = 250000

@@ -14,6 +14,14 @@ use crate::config::QuotingConfig;
 use crate::nonce_sender::{NonceSender, PendingTx};
 use crate::risk::RiskManager;
 
+/// Which sides to quote for a market.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuoteMode {
+    TwoSided,
+    BidsOnly,
+    AsksOnly,
+}
+
 /// How many blocks back from head to scan on startup.
 /// For 5-min markets with sub-1s blocks, 3000 blocks (~50 min) covers any live order.
 const STARTUP_SCAN_LOOKBACK: u64 = 3_000;
@@ -209,39 +217,45 @@ where
         ask_tick: u64,
         risk: &mut RiskManager,
         market_id: u64,
+        mode: QuoteMode,
+        lots_override: u64,
     ) -> (Vec<OrderBook::OrderParam>, Vec<OrderBook::OrderParam>) {
-        let lots = self.config.lots_per_level;
+        let lots = lots_override;
         let mut bid_params = Vec::new();
         let mut ask_params = Vec::new();
 
-        for level in 0..self.config.num_levels {
-            let tick = bid_tick.saturating_sub(level * 2);
-            if tick < 1 { continue; }
-            if !risk.can_place(market_id, lots as i64) {
-                warn!(market_id, tick, "risk limit — skipping bid");
-                continue;
+        if mode != QuoteMode::AsksOnly {
+            for level in 0..self.config.num_levels {
+                let tick = bid_tick.saturating_sub(level * 2);
+                if tick < 1 { continue; }
+                if !risk.can_place(market_id, lots as i64) {
+                    warn!(market_id, tick, "risk limit — skipping bid");
+                    continue;
+                }
+                bid_params.push(OrderBook::OrderParam {
+                    side: 0, // Bid
+                    orderType: 1, // GTC (enum: 0=GTB, 1=GTC)
+                    tick: tick as u8,
+                    lots,
+                });
             }
-            bid_params.push(OrderBook::OrderParam {
-                side: 0, // Bid
-                orderType: 1, // GTC (enum: 0=GTB, 1=GTC)
-                tick: tick as u8,
-                lots,
-            });
         }
 
-        for level in 0..self.config.num_levels {
-            let tick = ask_tick.saturating_add(level * 2);
-            if tick > 99 { continue; }
-            if !risk.can_place(market_id, -(lots as i64)) {
-                warn!(market_id, tick, "risk limit — skipping ask");
-                continue;
+        if mode != QuoteMode::BidsOnly {
+            for level in 0..self.config.num_levels {
+                let tick = ask_tick.saturating_add(level * 2);
+                if tick > 99 { continue; }
+                if !risk.can_place(market_id, -(lots as i64)) {
+                    warn!(market_id, tick, "risk limit — skipping ask");
+                    continue;
+                }
+                ask_params.push(OrderBook::OrderParam {
+                    side: 1, // Ask
+                    orderType: 1, // GTC (enum: 0=GTB, 1=GTC)
+                    tick: tick as u8,
+                    lots,
+                });
             }
-            ask_params.push(OrderBook::OrderParam {
-                side: 1, // Ask
-                orderType: 1, // GTC (enum: 0=GTB, 1=GTC)
-                tick: tick as u8,
-                lots,
-            });
         }
 
         (bid_params, ask_params)
@@ -352,8 +366,10 @@ where
         ask_tick: u64,
         fair_tick: i64,
         risk: &mut RiskManager,
+        mode: QuoteMode,
+        lots_override: u64,
     ) -> Result<()> {
-        let (bid_params, ask_params) = self.build_order_params(bid_tick, ask_tick, risk, market_id);
+        let (bid_params, ask_params) = self.build_order_params(bid_tick, ask_tick, risk, market_id, mode, lots_override);
         let all_params: Vec<OrderBook::OrderParam> = bid_params.into_iter().chain(ask_params).collect();
 
         if all_params.is_empty() {
@@ -699,6 +715,8 @@ where
         ask_tick: u64,
         fair_tick: i64,
         risk: &mut RiskManager,
+        mode: QuoteMode,
+        lots_override: u64,
     ) -> Result<()> {
         // If no existing orders, just place fresh
         let cancel_ids: Vec<U256> = match self.active_orders.get(&market_id) {
@@ -706,14 +724,14 @@ where
                 .chain(orders.ask_order_ids.iter())
                 .copied()
                 .collect(),
-            None => return self.place_quotes(market_id, bid_tick, ask_tick, fair_tick, risk).await,
+            None => return self.place_quotes(market_id, bid_tick, ask_tick, fair_tick, risk, mode, lots_override).await,
         };
 
         if cancel_ids.is_empty() {
-            return self.place_quotes(market_id, bid_tick, ask_tick, fair_tick, risk).await;
+            return self.place_quotes(market_id, bid_tick, ask_tick, fair_tick, risk, mode, lots_override).await;
         }
 
-        let (bid_params, ask_params) = self.build_order_params(bid_tick, ask_tick, risk, market_id);
+        let (bid_params, ask_params) = self.build_order_params(bid_tick, ask_tick, risk, market_id, mode, lots_override);
         let all_params: Vec<OrderBook::OrderParam> = bid_params.into_iter().chain(ask_params).collect();
 
         if self.dry_run {
