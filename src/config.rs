@@ -71,10 +71,15 @@ fn default_min_quote_secs() -> u64 { 30 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RiskConfig {
-    pub max_position_per_market: i64,
-    pub max_total_exposure: i64,
+    /// Max USDT at risk per market (dollar-based budget)
+    pub max_loss_budget_usdt: f64,
+    /// Max tick shift from inventory skew
+    #[serde(default = "default_max_skew_ticks")]
+    pub max_skew_ticks: i64,
     pub stale_data_timeout_secs: u64,
 }
+
+fn default_max_skew_ticks() -> i64 { 6 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct VolatilityConfig {

@@ -32,8 +32,8 @@ expiry_spread_multiplier_60s = 2.0
 min_quote_secs = 30
 
 [risk]
-max_position_per_market = 250000
-max_total_exposure = 1000000
+max_loss_budget_usdt = 500.0
+max_skew_ticks = 6
 stale_data_timeout_secs = 10
 
 [volatility]

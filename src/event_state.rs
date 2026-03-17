@@ -10,6 +10,8 @@ pub struct FillEvent {
     pub filled_lots: u64,
     /// "bid" or "ask" — looked up from quoter active_orders at event time
     pub side: String,
+    /// Clearing tick from the BatchCleared event for this batch
+    pub clearing_tick: u64,
 }
 
 /// Shared state fed by WS event subscriptions and read by the main loop.
@@ -28,4 +30,8 @@ pub struct EventState {
 
     /// True once the initial market snapshot has been loaded.
     pub initialized: bool,
+
+    /// Most recent clearing tick per market from BatchCleared events.
+    /// market_id → clearing_tick
+    pub clearing_ticks: HashMap<u64, u64>,
 }

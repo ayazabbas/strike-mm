@@ -296,11 +296,15 @@ async fn try_subscribe_all(
                             "FILL EVENT — OrderSettled"
                         );
 
+                        // Look up clearing tick for this market
+                        let clearing_tick = shared_state.lock().await.clearing_ticks
+                            .get(&market_id).copied().unwrap_or(50);
                         shared_state.lock().await.fills.push(FillEvent {
                             order_id: order_id.to::<u64>(),
                             market_id,
                             filled_lots,
                             side,
+                            clearing_tick,
                         });
                         fill_notify.notify_one();
                     }
@@ -334,6 +338,11 @@ async fn try_subscribe_all(
                             matched_lots = matched,
                             "BatchCleared"
                         );
+                        // Store clearing tick for fill cost basis
+                        {
+                            let clearing_tick = event.clearingTick.to::<u64>();
+                            shared_state.lock().await.clearing_ticks.insert(market_id, clearing_tick);
+                        }
                         if matched > 0 {
                             // Only invalidate on actual fills — GTC zero-fill orders roll automatically
                             shared_state.lock().await.cleared_markets.insert(market_id);
@@ -459,8 +468,8 @@ async fn main() -> Result<()> {
     );
     let mut market_mgr = market_manager::MarketManager::new();
     let mut risk_mgr = risk::RiskManager::new(
-        cfg.risk.max_position_per_market,
-        cfg.risk.max_total_exposure,
+        cfg.risk.max_loss_budget_usdt,
+        cfg.risk.max_skew_ticks,
     );
 
     let http_client = reqwest::Client::new();
@@ -727,17 +736,22 @@ async fn main() -> Result<()> {
                     drop(state);
 
                     for fill in &pending_fills {
-                        let sign: i64 = if fill.side == "bid" { 1 } else { -1 };
-                        let lots = fill.filled_lots as i64 * sign;
+                        let is_bid = fill.side == "bid";
+                        let cost = if is_bid {
+                            risk::lots_to_usdt(fill.clearing_tick, fill.filled_lots)
+                        } else {
+                            (1.0 - fill.clearing_tick as f64 / 100.0) * fill.filled_lots as f64 * 0.01
+                        };
                         info!(
                             order_id = fill.order_id,
                             market_id = fill.market_id,
                             side = %fill.side,
                             filled_lots = fill.filled_lots,
-                            signed_lots = lots,
+                            clearing_tick = fill.clearing_tick,
+                            cost_usdt = format!("{cost:.2}"),
                             "FILL DETECTED (event) — position updated"
                         );
-                        risk_mgr.record_fill(fill.market_id, lots);
+                        risk_mgr.record_fill(fill.market_id, fill.clearing_tick, fill.filled_lots, is_bid);
                     }
                 } else {
                     // Fallback: poll indexer for fill tracking
@@ -749,18 +763,18 @@ async fn main() -> Result<()> {
                                 if order.status == "filled" {
                                     if let Some(prev) = prev_order_states.get(&order.id) {
                                         if prev.status != "filled" {
-                                            let sign: i64 = if order.side == "bid" { 1 } else { -1 };
-                                            let lots = order.lots as i64 * sign;
+                                            let is_bid = order.side == "bid";
+                                            // Use order tick as clearing price approximation (indexer fallback)
+                                            let clearing_tick = order.tick;
                                             info!(
                                                 order_id = order.id,
                                                 market_id = order.market_id,
                                                 side = %order.side,
                                                 tick = order.tick,
                                                 lots = order.lots,
-                                                signed_lots = lots,
-                                                "FILL DETECTED — position updated"
+                                                "FILL DETECTED (indexer) — position updated"
                                             );
-                                            risk_mgr.record_fill(order.market_id as u64, lots);
+                                            risk_mgr.record_fill(order.market_id as u64, clearing_tick, order.lots, is_bid);
                                         }
                                     }
                                 }
@@ -850,9 +864,31 @@ async fn main() -> Result<()> {
                     };
 
                     let position = risk_mgr.position(market_id);
-                    let skew = risk_mgr.inventory_skew(market_id, effective_spread as i64);
+                    let pos_state = risk_mgr.position_state(market_id);
+                    let skew = risk_mgr.inventory_skew(market_id);
                     let (bid_tick, ask_tick) =
                         pricing::compute_ticks(fair, effective_spread, skew);
+
+                    // Directional quote sizing: reduce size on same side, full on opposite
+                    let max_loss_budget = risk_mgr.max_loss_budget();
+                    let (bid_lots, ask_lots) = {
+                        let base = effective_lots;
+                        let num_levels = cfg.quoting.num_levels;
+                        if pos_state.net_lots > 0 {
+                            // Long YES: reduce bids (same side), full asks (flattening)
+                            let bl = pos_state.quote_lots_same_side(bid_tick, base, num_levels, max_loss_budget);
+                            (bl, base)
+                        } else if pos_state.net_lots < 0 {
+                            // Short YES: full bids (flattening), reduce asks (same side)
+                            let al = pos_state.quote_lots_same_side(100 - ask_tick, base, num_levels, max_loss_budget);
+                            (base, al)
+                        } else {
+                            // Flat: both sides use budget-aware sizing
+                            let bl = pos_state.quote_lots_same_side(bid_tick, base, num_levels, max_loss_budget);
+                            let al = pos_state.quote_lots_same_side(100 - ask_tick, base, num_levels, max_loss_budget);
+                            (bl, al)
+                        }
+                    };
 
                     // Force requote when quote mode changes
                     let mode_changed = if let Some(orders) = quoter.active_orders.get(&market_id) {
@@ -875,6 +911,8 @@ async fn main() -> Result<()> {
                         } else {
                             "fair value moved >= requote threshold"
                         };
+                        let exposure_ratio = pos_state.exposure_ratio(max_loss_budget);
+                        let expected_pnl = pos_state.expected_pnl(fair);
                         info!(
                             market_id,
                             reason,
@@ -893,12 +931,17 @@ async fn main() -> Result<()> {
                             effective_spread,
                             spread_multiplier = format!("{spread_multiplier:.1}"),
                             quote_mode = ?quote_mode,
-                            effective_lots,
+                            bid_lots,
+                            ask_lots,
+                            exposure_ratio = format!("{exposure_ratio:.2}"),
+                            expected_pnl = format!("{expected_pnl:.2}"),
+                            max_loss = format!("{:.2}", pos_state.total_max_loss),
+                            remaining_budget = format!("{:.2}", pos_state.remaining_budget(max_loss_budget)),
                             price_age_ms,
                             "REQUOTING"
                         );
                         quoter
-                            .requote(market_id, bid_tick, ask_tick, fair_tick, &mut risk_mgr, quote_mode, effective_lots)
+                            .requote(market_id, bid_tick, ask_tick, fair_tick, &mut risk_mgr, quote_mode, bid_lots, ask_lots)
                             .await?;
                         // Sync immediately so event subscriber can look up new order IDs
                         if ws_enabled {
