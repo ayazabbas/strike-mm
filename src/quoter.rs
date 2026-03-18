@@ -164,8 +164,6 @@ pub async fn recover_live_orders<P: Provider + Clone>(
 pub struct MarketOrders {
     pub bid_order_ids: Vec<U256>,
     pub ask_order_ids: Vec<U256>,
-    pub last_bid_tick: u64,
-    pub last_ask_tick: u64,
     pub last_fair_tick: i64,
     pub last_quote_time: Instant,
 }
@@ -289,8 +287,6 @@ where
                 self.active_orders.insert(market_id, MarketOrders {
                     bid_order_ids: bids,
                     ask_order_ids: asks,
-                    last_bid_tick: 0,
-                    last_ask_tick: 0,
                     last_fair_tick: 0,
                     last_quote_time: Instant::now(),
                 });
@@ -387,8 +383,6 @@ where
             self.active_orders.insert(market_id, MarketOrders {
                 bid_order_ids: Vec::new(),
                 ask_order_ids: Vec::new(),
-                last_bid_tick: bid_tick,
-                last_ask_tick: ask_tick,
                 last_fair_tick: fair_tick,
                 last_quote_time: Instant::now(),
             });
@@ -439,8 +433,6 @@ where
         self.active_orders.insert(market_id, MarketOrders {
             bid_order_ids: bid_ids,
             ask_order_ids: ask_ids,
-            last_bid_tick: bid_tick,
-            last_ask_tick: ask_tick,
             last_fair_tick: fair_tick,
             last_quote_time: Instant::now(),
         });
@@ -746,8 +738,6 @@ where
             self.active_orders.insert(market_id, MarketOrders {
                 bid_order_ids: Vec::new(),
                 ask_order_ids: Vec::new(),
-                last_bid_tick: bid_tick,
-                last_ask_tick: ask_tick,
                 last_fair_tick: fair_tick,
                 last_quote_time: Instant::now(),
             });
@@ -801,8 +791,6 @@ where
         self.active_orders.insert(market_id, MarketOrders {
             bid_order_ids: bid_ids,
             ask_order_ids: ask_ids,
-            last_bid_tick: bid_tick,
-            last_ask_tick: ask_tick,
             last_fair_tick: fair_tick,
             last_quote_time: Instant::now(),
         });
@@ -814,35 +802,6 @@ where
         self.active_orders.contains_key(&market_id)
     }
 
-    /// Get list of markets we're quoting.
-    pub fn quoting_markets(&self) -> Vec<u64> {
-        self.active_orders.keys().copied().collect()
-    }
-
-    /// Look up which side an order was placed on (from active_orders).
-    pub fn order_side(&self, order_id: U256) -> Option<&'static str> {
-        for orders in self.active_orders.values() {
-            if orders.bid_order_ids.contains(&order_id) {
-                return Some("bid");
-            }
-            if orders.ask_order_ids.contains(&order_id) {
-                return Some("ask");
-            }
-        }
-        None
-    }
-
-    /// Look up which market an order belongs to (from active_orders).
-    pub fn order_market(&self, order_id: U256) -> Option<u64> {
-        for (&market_id, orders) in &self.active_orders {
-            if orders.bid_order_ids.contains(&order_id)
-                || orders.ask_order_ids.contains(&order_id)
-            {
-                return Some(market_id);
-            }
-        }
-        None
-    }
 }
 
 /// Approve the Vault contract to spend USDT on behalf of the signer.

@@ -17,7 +17,6 @@ pub struct Config {
 pub struct RpcConfig {
     pub url: String,
     pub wss_url: Option<String>,
-    pub chain_id: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,15 +58,11 @@ pub struct QuotingConfig {
     /// Spread multiplier when <60s to expiry
     #[serde(default = "default_spread_mult_60")]
     pub expiry_spread_multiplier_60s: f64,
-    /// Stop quoting entirely below this many seconds to expiry
-    #[serde(default = "default_min_quote_secs")]
-    pub min_quote_secs: u64,
 }
 
 fn default_one_sided_threshold() -> f64 { 0.90 }
 fn default_spread_mult_120() -> f64 { 1.5 }
 fn default_spread_mult_60() -> f64 { 2.0 }
-fn default_min_quote_secs() -> u64 { 30 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RiskConfig {

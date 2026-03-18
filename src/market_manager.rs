@@ -1,7 +1,7 @@
 use eyre::{Result, WrapErr};
 use serde::Deserialize;
 use std::collections::HashSet;
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Market {
@@ -105,18 +105,9 @@ impl MarketManager {
     }
 
     /// Check if we're tracking a market.
+    #[cfg(test)]
     pub fn is_active(&self, market_id: u64) -> bool {
         self.active_ids.contains(&market_id)
-    }
-
-    /// Get all active market IDs.
-    pub fn active_market_ids(&self) -> Vec<u64> {
-        self.active_ids.iter().copied().collect()
-    }
-
-    /// Remove a specific market (e.g., on error).
-    pub fn remove(&mut self, market_id: u64) {
-        self.active_ids.remove(&market_id);
     }
 }
 

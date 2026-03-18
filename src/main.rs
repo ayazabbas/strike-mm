@@ -49,7 +49,6 @@ struct IndexerOrder {
     side: String,
     tick: u64,
     lots: u64,
-    filled_lots: u64,
     status: String,
 }
 
