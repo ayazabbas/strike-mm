@@ -7,13 +7,13 @@ chain_id = 97
 private_key_env = "MM_PRIVATE_KEY"
 
 [contracts]
-order_book = "0x311Fb3059BCD31076e5215674D22f1c7c8b8110A"
-vault = "0xD18fca3501F6babc6E7a42376189c62c748cf4Fa"
+order_book = "0x9675bab261a6f168dd76fedb6d8706021e338c16"
+vault = "0x04606a6f4909d0e9d9d763083d7649a2229eb679"
 usdt = "0xb242dc031998b06772C63596Bfce091c80D4c3fA"
-redemption = "0x3ab018Af948230B60f04c43DB1512Aa78B600ab8"
-outcome_token = "0x59509e952ce26a04d8a418B13b2e6D3109Dc2aae"
-batch_auction = "0x215ea5E4b9e7d587A654f3524156BB21dabE3b34"
-market_factory = "0x371ac5301cf0eEB50893702788A9c7dd2bC66a29"
+redemption = "0xd181cc898bbbf4d2ddaebf6f245f043dd8f93704"
+outcome_token = "0xc398678d4eb9b5a67dd3b2ff9cd6c517140fcf65"
+batch_auction = "0x62224a55d05175eaeb22fc6263355c820c77e849"
+market_factory = "0xf3ad14f117348de4886c29764fdcaf9c62794535"
 
 [indexer]
 url = "https://app.strike.pm/api"
