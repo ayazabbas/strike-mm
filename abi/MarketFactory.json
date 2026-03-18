@@ -16,11 +16,6 @@
         "name": "_outcomeToken",
         "type": "address",
         "internalType": "address"
-      },
-      {
-        "name": "_feeCollector",
-        "type": "address",
-        "internalType": "address"
       }
     ],
     "stateMutability": "nonpayable"
@@ -189,19 +184,6 @@
         "name": "",
         "type": "uint128",
         "internalType": "uint128"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "feeCollector",
-    "inputs": [],
-    "outputs": [
-      {
-        "name": "",
-        "type": "address",
-        "internalType": "address"
       }
     ],
     "stateMutability": "view"
@@ -519,19 +501,6 @@
   },
   {
     "type": "function",
-    "name": "setFeeCollector",
-    "inputs": [
-      {
-        "name": "_collector",
-        "type": "address",
-        "internalType": "address"
-      }
-    ],
-    "outputs": [],
-    "stateMutability": "nonpayable"
-  },
-  {
-    "type": "function",
     "name": "setResolved",
     "inputs": [
       {
@@ -613,19 +582,6 @@
         "type": "bool",
         "indexed": false,
         "internalType": "bool"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
-    "name": "FeeCollectorUpdated",
-    "inputs": [
-      {
-        "name": "collector",
-        "type": "address",
-        "indexed": true,
-        "internalType": "address"
       }
     ],
     "anonymous": false
