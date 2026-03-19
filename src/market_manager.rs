@@ -1,22 +1,8 @@
 use eyre::{Result, WrapErr};
-use serde::Deserialize;
 use std::collections::HashSet;
 use tracing::info;
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct Market {
-    pub id: i64,
-    pub expiry_time: i64,
-    pub status: String,
-    pub pyth_feed_id: Option<String>,
-    pub strike_price: Option<i64>,
-    pub batch_interval: i64,
-}
-
-#[derive(Debug, Deserialize)]
-struct MarketsResponse {
-    markets: Vec<Market>,
-}
+use strike_sdk::indexer::types::Market;
 
 /// BTC/USD Pyth feed ID (mainnet).
 const BTC_USD_FEED: &str = "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43";
@@ -28,6 +14,12 @@ pub async fn fetch_active_markets(
     min_expiry_secs: u64,
 ) -> Result<Vec<Market>> {
     let url = format!("{indexer_url}/markets");
+
+    #[derive(serde::Deserialize)]
+    struct MarketsResponse {
+        markets: Vec<Market>,
+    }
+
     let resp: MarketsResponse = client
         .get(&url)
         .send()

@@ -19,8 +19,8 @@ pub fn fair_value(spot: f64, strike: f64, vol: f64, time_to_expiry: f64) -> f64 
         return 0.0;
     }
 
-    let d = ((spot / strike).ln() + vol * vol * time_to_expiry / 2.0)
-        / (vol * time_to_expiry.sqrt());
+    let d =
+        ((spot / strike).ln() + vol * vol * time_to_expiry / 2.0) / (vol * time_to_expiry.sqrt());
 
     let normal = Normal::new(0.0, 1.0).unwrap();
     let p = normal.cdf(d);
@@ -112,10 +112,7 @@ mod tests {
     fn test_atm() {
         // BTC at 80k, strike at 80k — should be ~0.5
         let p = fair_value(80_000.0, 80_000.0, 0.50, 5.0 / 525_600.0);
-        assert!(
-            (0.45..=0.55).contains(&p),
-            "ATM should be ~0.5, got {p}"
-        );
+        assert!((0.45..=0.55).contains(&p), "ATM should be ~0.5, got {p}");
     }
 
     #[test]

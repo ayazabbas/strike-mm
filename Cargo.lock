@@ -3944,12 +3944,26 @@ dependencies = [
  "serde",
  "serde_json",
  "statrs",
+ "strike-sdk",
  "tokio",
  "tokio-tungstenite",
  "toml",
  "tracing",
  "tracing-subscriber",
- "url",
+]
+
+[[package]]
+name = "strike-sdk"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "eyre",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

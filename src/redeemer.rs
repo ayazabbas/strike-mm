@@ -1,88 +1,11 @@
-use alloy::primitives::{Address, Bytes, U256};
-use alloy::providers::Provider;
-use alloy::sol;
-use alloy::sol_types::SolCall;
 use eyre::Result;
 use std::collections::HashSet;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::market_manager::Market;
-use crate::nonce_sender::NonceSender;
-
-sol!(
-    #[sol(rpc)]
-    RedemptionContract,
-    "abi/Redemption.json"
-);
-
-sol!(
-    #[sol(rpc)]
-    OutcomeToken,
-    "abi/OutcomeToken.json"
-);
-
-/// Multicall3 at canonical address
-const MULTICALL3: Address = Address::new([
-    0xca, 0x11, 0xbd, 0xe0, 0x59, 0x77, 0xb3, 0x63, 0x11, 0x67,
-    0x02, 0x88, 0x62, 0xbE, 0x2a, 0x17, 0x39, 0x76, 0xCA, 0x11,
-]);
-
-sol! {
-    struct Call3 {
-        address target;
-        bool allowFailure;
-        bytes callData;
-    }
-
-    struct MulticallResult {
-        bool success;
-        bytes returnData;
-    }
-
-    function aggregate3(Call3[] calldata calls) external payable returns (MulticallResult[] memory returnData);
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct MarketsResponse {
-    markets: Vec<Market>,
-}
-
-/// Fetch resolved markets from the indexer.
-async fn fetch_resolved_markets(
-    client: &reqwest::Client,
-    indexer_url: &str,
-) -> Result<Vec<Market>> {
-    let url = format!("{indexer_url}/markets");
-    let resp: MarketsResponse = client
-        .get(&url)
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    let resolved: Vec<Market> = resp
-        .markets
-        .into_iter()
-        .filter(|m| m.status == "resolved")
-        .collect();
-
-    Ok(resolved)
-}
+use strike_sdk::prelude::*;
 
 /// Background task that redeems resolved market positions every 10 minutes.
-pub async fn run_redeem_loop<P>(
-    provider: P,
-    nonce_sender: Arc<Mutex<NonceSender>>,
-    redemption_addr: Address,
-    outcome_token_addr: Address,
-    mm_address: Address,
-    indexer_url: String,
-) where
-    P: Provider + Clone,
-{
-    let client = reqwest::Client::new();
+pub async fn run_redeem_loop(client: StrikeClient) {
     let mut redeemed: HashSet<u64> = HashSet::new();
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(600));
 
@@ -94,61 +17,42 @@ pub async fn run_redeem_loop<P>(
     loop {
         interval.tick().await;
 
-        if let Err(e) = redeem_cycle(
-            &provider,
-            &nonce_sender,
-            &client,
-            redemption_addr,
-            outcome_token_addr,
-            mm_address,
-            &indexer_url,
-            &mut redeemed,
-        )
-        .await
-        {
+        if let Err(e) = redeem_cycle(&client, &mut redeemed).await {
             warn!(err = %e, "redeemer: cycle failed");
         }
     }
 }
 
-async fn redeem_cycle<P>(
-    provider: &P,
-    nonce_sender: &Arc<Mutex<NonceSender>>,
-    client: &reqwest::Client,
-    redemption_addr: Address,
-    outcome_token_addr: Address,
-    mm_address: Address,
-    indexer_url: &str,
-    redeemed: &mut HashSet<u64>,
-) -> Result<()>
-where
-    P: Provider + Clone,
-{
-    let markets = fetch_resolved_markets(client, indexer_url).await?;
+async fn redeem_cycle(client: &StrikeClient, redeemed: &mut HashSet<u64>) -> Result<()> {
+    let markets = client
+        .indexer()
+        .get_markets()
+        .await
+        .map_err(|e| eyre::eyre!("indexer error: {e}"))?;
 
-    if markets.is_empty() {
+    let resolved: Vec<_> = markets
+        .into_iter()
+        .filter(|m| m.status == "resolved")
+        .collect();
+
+    if resolved.is_empty() {
         return Ok(());
     }
 
-    info!(count = markets.len(), "redeemer: found resolved markets");
+    info!(count = resolved.len(), "redeemer: found resolved markets");
 
-    for market in &markets {
+    let owner = client
+        .signer_address()
+        .ok_or_else(|| eyre::eyre!("no signer address"))?;
+
+    for market in &resolved {
         let market_id = market.id as u64;
 
         if redeemed.contains(&market_id) {
             continue;
         }
 
-        match try_redeem_market(
-            provider,
-            nonce_sender,
-            redemption_addr,
-            outcome_token_addr,
-            mm_address,
-            market_id,
-        )
-        .await
-        {
+        match try_redeem_market(client, owner, market_id).await {
             Ok(did_redeem) => {
                 if did_redeem {
                     info!(market_id, "redeemer: successfully redeemed");
@@ -164,33 +68,16 @@ where
     Ok(())
 }
 
-async fn try_redeem_market<P>(
-    provider: &P,
-    nonce_sender: &Arc<Mutex<NonceSender>>,
-    redemption_addr: Address,
-    outcome_token_addr: Address,
-    mm_address: Address,
+async fn try_redeem_market(
+    client: &StrikeClient,
+    owner: alloy::primitives::Address,
     market_id: u64,
-) -> Result<bool>
-where
-    P: Provider + Clone,
-{
-    let market_id_u256 = U256::from(market_id);
-    let outcome_token = OutcomeToken::new(outcome_token_addr, provider.clone());
-
-    // Get token IDs
-    let yes_token_id = outcome_token.yesTokenId(market_id_u256).call().await?;
-    let no_token_id = outcome_token.noTokenId(market_id_u256).call().await?;
-
-    // Check balances
-    let yes_balance = outcome_token
-        .balanceOf(mm_address, yes_token_id)
-        .call()
-        .await?;
-    let no_balance = outcome_token
-        .balanceOf(mm_address, no_token_id)
-        .call()
-        .await?;
+) -> Result<bool> {
+    let (yes_balance, no_balance) = client
+        .redeem()
+        .balances(market_id, owner)
+        .await
+        .map_err(|e| eyre::eyre!("balance check failed: {e}"))?;
 
     if yes_balance.is_zero() && no_balance.is_zero() {
         info!(market_id, "redeemer: no outcome tokens to redeem");
@@ -204,71 +91,33 @@ where
         "redeemer: found outcome tokens, attempting redemption"
     );
 
-    // Build redeem calls — try both sides via multicall with allowFailure.
-    let mut calls: Vec<Call3> = Vec::new();
-
+    // Redeem YES tokens
     if !yes_balance.is_zero() {
-        let calldata =
-            RedemptionContract::redeemCall {
-                factoryMarketId: market_id_u256,
-                amount: yes_balance,
-            }
-            .abi_encode();
-        calls.push(Call3 {
-            target: redemption_addr,
-            allowFailure: true,
-            callData: Bytes::from(calldata),
-        });
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.redeem().redeem(market_id, yes_balance),
+        )
+        .await
+        {
+            Ok(Ok(())) => info!(market_id, "redeemer: YES redemption confirmed"),
+            Ok(Err(e)) => warn!(market_id, err = %e, "redeemer: YES redemption failed"),
+            Err(_) => warn!(market_id, "redeemer: YES redemption timed out"),
+        }
     }
 
+    // Redeem NO tokens
     if !no_balance.is_zero() {
-        let calldata =
-            RedemptionContract::redeemCall {
-                factoryMarketId: market_id_u256,
-                amount: no_balance,
-            }
-            .abi_encode();
-        calls.push(Call3 {
-            target: redemption_addr,
-            allowFailure: true,
-            callData: Bytes::from(calldata),
-        });
-    }
-
-    // Build the multicall tx — NonceSender handles nonce
-    let multicall_data = aggregate3Call { calls }.abi_encode();
-    let mut tx = alloy::rpc::types::TransactionRequest::default()
-        .to(MULTICALL3)
-        .input(Bytes::from(multicall_data).into());
-    tx.gas = Some(500_000);
-
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        async {
-            let pending: crate::nonce_sender::PendingTx =
-                nonce_sender.lock().await.send(tx).await?;
-            // Lock released here — receipt wait is outside the lock
-            let receipt = pending.get_receipt().await?;
-            Ok::<_, eyre::Report>(receipt)
-        },
-    )
-    .await
-    {
-        Ok(Ok(receipt)) => {
-            info!(
-                market_id,
-                tx = %receipt.transaction_hash,
-                "redeemer: redemption tx confirmed"
-            );
-            Ok(true)
-        }
-        Ok(Err(e)) => {
-            warn!(market_id, err = %e, "redeemer: redemption tx failed");
-            Err(e)
-        }
-        Err(_) => {
-            warn!(market_id, "redeemer: redemption tx timed out after 30s");
-            eyre::bail!("redemption tx timed out");
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.redeem().redeem(market_id, no_balance),
+        )
+        .await
+        {
+            Ok(Ok(())) => info!(market_id, "redeemer: NO redemption confirmed"),
+            Ok(Err(e)) => warn!(market_id, err = %e, "redeemer: NO redemption failed"),
+            Err(_) => warn!(market_id, "redeemer: NO redemption timed out"),
         }
     }
+
+    Ok(true)
 }

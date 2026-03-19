@@ -129,7 +129,10 @@ impl RiskManager {
 
     /// Get current net lots for a market (positive = long YES).
     pub fn position(&self, market_id: u64) -> i64 {
-        self.positions.get(&market_id).map(|p| p.net_lots).unwrap_or(0)
+        self.positions
+            .get(&market_id)
+            .map(|p| p.net_lots)
+            .unwrap_or(0)
     }
 
     /// Get position state for a market.
@@ -187,7 +190,11 @@ impl RiskManager {
         let ratio = pos.exposure_ratio(self.max_loss_budget);
         let skew = (ratio * self.max_skew_ticks as f64).round() as i64;
         // Direction: positive when long YES, negative when short YES
-        if pos.net_lots > 0 { skew } else { -skew }
+        if pos.net_lots > 0 {
+            skew
+        } else {
+            -skew
+        }
     }
 
     /// Get max_loss_budget for external use (quote sizing).
@@ -333,7 +340,7 @@ mod tests {
 
         // Fill $400 worth
         ps.record_fill(50, 80000, true); // 80000 * 0.005 = $400
-        // remaining = 100, max_lots = 100/0.005/2 = 10000
+                                         // remaining = 100, max_lots = 100/0.005/2 = 10000
         assert_eq!(ps.quote_lots_same_side(50, 25000, 2, 500.0), 10000);
 
         // Budget exhausted

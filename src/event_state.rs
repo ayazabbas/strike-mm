@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::market_manager::Market;
+use strike_sdk::indexer::types::Market;
 
 /// A fill detected from an OrderSettled event.
 #[derive(Debug, Clone)]
