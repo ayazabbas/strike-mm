@@ -73,84 +73,42 @@ async fn try_redeem_market(
     owner: alloy::primitives::Address,
     market_id: u64,
 ) -> Result<bool> {
-    // Check internal vault positions first (v1.1 markets)
-    let mut redeemed_any = false;
+    let (yes_lots, no_lots) = client
+        .redeem()
+        .internal_positions(market_id, owner)
+        .await
+        .map_err(|e| eyre::eyre!("position check failed: {e}"))?;
 
-    if let Ok((yes_lots, no_lots)) = client.redeem().internal_positions(market_id, owner).await {
-        if yes_lots > 0 || no_lots > 0 {
-            let amount = alloy::primitives::U256::from(yes_lots.max(no_lots));
-            info!(
-                market_id,
-                yes_lots,
-                no_lots,
-                "redeemer: found internal positions, attempting redemption"
-            );
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                client.redeem().redeem(market_id, amount),
-            )
-            .await
-            {
-                Ok(Ok(())) => {
-                    info!(market_id, "redeemer: internal position redemption confirmed");
-                    redeemed_any = true;
-                }
-                Ok(Err(e)) => warn!(market_id, err = %e, "redeemer: internal position redemption failed"),
-                Err(_) => warn!(market_id, "redeemer: internal position redemption timed out"),
-            }
-        }
+    if yes_lots == 0 && no_lots == 0 {
+        info!(market_id, "redeemer: no positions to redeem");
+        return Ok(false);
     }
 
-    // Fall back to ERC1155 balance check (v1.0 markets)
-    if !redeemed_any {
-        let (yes_balance, no_balance) = client
-            .redeem()
-            .balances(market_id, owner)
-            .await
-            .map_err(|e| eyre::eyre!("balance check failed: {e}"))?;
+    let amount = alloy::primitives::U256::from(yes_lots.max(no_lots));
+    info!(
+        market_id,
+        yes_lots,
+        no_lots,
+        "redeemer: found positions, attempting redemption"
+    );
 
-        if yes_balance.is_zero() && no_balance.is_zero() {
-            info!(market_id, "redeemer: no positions to redeem");
-            return Ok(false);
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        client.redeem().redeem(market_id, amount),
+    )
+    .await
+    {
+        Ok(Ok(())) => {
+            info!(market_id, "redeemer: redemption confirmed");
+            Ok(true)
         }
-
-        info!(
-            market_id,
-            yes_balance = %yes_balance,
-            no_balance = %no_balance,
-            "redeemer: found ERC1155 tokens, attempting redemption"
-        );
-
-        // Redeem YES tokens
-        if !yes_balance.is_zero() {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                client.redeem().redeem(market_id, yes_balance),
-            )
-            .await
-            {
-                Ok(Ok(())) => info!(market_id, "redeemer: YES redemption confirmed"),
-                Ok(Err(e)) => warn!(market_id, err = %e, "redeemer: YES redemption failed"),
-                Err(_) => warn!(market_id, "redeemer: YES redemption timed out"),
-            }
+        Ok(Err(e)) => {
+            warn!(market_id, err = %e, "redeemer: redemption failed");
+            Err(eyre::eyre!("redemption failed: {e}"))
         }
-
-        // Redeem NO tokens
-        if !no_balance.is_zero() {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                client.redeem().redeem(market_id, no_balance),
-            )
-            .await
-            {
-                Ok(Ok(())) => info!(market_id, "redeemer: NO redemption confirmed"),
-                Ok(Err(e)) => warn!(market_id, err = %e, "redeemer: NO redemption failed"),
-                Err(_) => warn!(market_id, "redeemer: NO redemption timed out"),
-            }
+        Err(_) => {
+            warn!(market_id, "redeemer: redemption timed out");
+            Err(eyre::eyre!("redemption timed out"))
         }
-
-        redeemed_any = true;
     }
-
-    Ok(redeemed_any)
 }

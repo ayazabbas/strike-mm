@@ -33,7 +33,6 @@ pub struct ContractsConfig {
     pub vault: String,
     pub usdt: String,
     pub redemption: String,
-    pub outcome_token: String,
     pub batch_auction: Option<String>,
     pub market_factory: Option<String>,
 }
@@ -123,7 +122,7 @@ impl Config {
             vault: parse_addr(&self.contracts.vault, "vault")?,
             usdt: parse_addr(&self.contracts.usdt, "usdt")?,
             redemption: parse_addr(&self.contracts.redemption, "redemption")?,
-            outcome_token: parse_addr(&self.contracts.outcome_token, "outcome_token")?,
+            outcome_token: Address::ZERO,
             batch_auction: self
                 .contracts
                 .batch_auction

@@ -36,7 +36,6 @@ cargo run -- --config path/to/config.toml
 | MarketFactory | `0xf3ad14f117348de4886c29764fdcaf9c62794535` |
 | BatchAuction | `0x62224a55d05175eaeb22fc6263355c820c77e849` |
 | Vault | `0x04606a6f4909d0e9d9d763083d7649a2229eb679` |
-| OutcomeToken | `0xc398678d4eb9b5a67dd3b2ff9cd6c517140fcf65` |
 | Redemption | `0xd181cc898bbbf4d2ddaebf6f245f043dd8f93704` |
 | MockUSDT | `0xb242dc031998b06772C63596Bfce091c80D4c3fA` |
 
@@ -63,7 +62,6 @@ All configuration is in TOML format. See `config/default.toml` for the full exam
 | `vault` | string | Vault contract address |
 | `usdt` | string | MockUSDT contract address |
 | `redemption` | string | Redemption contract address |
-| `outcome_token` | string | OutcomeToken contract address |
 | `batch_auction` | string | BatchAuction contract address |
 | `market_factory` | string | MarketFactory contract address |
 
