@@ -1,0 +1,25 @@
+[rpc]
+url = "https://bsc-mainnet.core.chainstack.com/8a63a8a2e1e14950705b68ae8b0e1948"
+wss_url = "wss://bsc-mainnet.core.chainstack.com/8a63a8a2e1e14950705b68ae8b0e1948"
+chain_id = 56
+
+[wallet]
+private_key_env = "MM_PRIVATE_KEY"
+
+[contracts]
+order_book = "0x074Ca415B501Bcca0020e9c312cf1F80796Ae3b1"
+vault = "0x2556E5DE92281EdA3300F044dfB9158416407eed"
+usdt = "0x55d398326f99059fF775485246999027B3197955"
+redemption = "0xe030C0c6FeEc3512f2033493AC0B46B6F773FB86"
+batch_auction = "0xa8e9a6B62B93A4360969972Dc7300C6Be7B5f9D8"
+market_factory = "0x9c045dc57c1132e5D13b234F8e166cAaD8CE2c3D"
+
+[indexer]
+url = "https://app.strike.pm/api/mainnet"
+poll_interval_secs = 1
+
+[strategy]
+budget_per_market = 500.0
+spread_ticks = 6
+lots_per_level = 25000
+levels_per_side = 2
