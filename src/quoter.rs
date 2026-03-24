@@ -239,13 +239,24 @@ impl Quoter {
             return Ok(());
         }
 
-        let placed = tokio::time::timeout(
+        let placed = match tokio::time::timeout(
             std::time::Duration::from_secs(30),
             self.client.orders().place(market_id, &all_params),
         )
         .await
-        .map_err(|_| eyre::eyre!("placeOrders timed out"))?
-        .map_err(|e| eyre::eyre!("placeOrders failed: {e}"))?;
+        {
+            Ok(Ok(placed)) => placed,
+            Ok(Err(e)) => {
+                warn!(market_id, err = %e, "placeOrders failed — will retry next cycle");
+                self.active_orders.remove(&market_id);
+                return Ok(());
+            }
+            Err(_) => {
+                warn!(market_id, "placeOrders timed out — will retry next cycle");
+                self.active_orders.remove(&market_id);
+                return Ok(());
+            }
+        };
 
         let mut bid_ids = Vec::new();
         let mut ask_ids = Vec::new();
@@ -489,15 +500,26 @@ impl Quoter {
         let cancel_count = cancel_ids.len();
         let place_count = all_params.len();
 
-        let placed = tokio::time::timeout(
+        let placed = match tokio::time::timeout(
             std::time::Duration::from_secs(30),
             self.client
                 .orders()
                 .replace(&cancel_ids, market_id, &all_params),
         )
         .await
-        .map_err(|_| eyre::eyre!("replaceOrders timed out"))?
-        .map_err(|e| eyre::eyre!("replaceOrders failed: {e}"))?;
+        {
+            Ok(Ok(placed)) => placed,
+            Ok(Err(e)) => {
+                warn!(market_id, err = %e, "replaceOrders failed — will retry next cycle");
+                self.active_orders.remove(&market_id);
+                return Ok(());
+            }
+            Err(_) => {
+                warn!(market_id, "replaceOrders timed out — will retry next cycle");
+                self.active_orders.remove(&market_id);
+                return Ok(());
+            }
+        };
 
         let mut bid_ids = Vec::new();
         let mut ask_ids = Vec::new();
