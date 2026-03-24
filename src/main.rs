@@ -575,7 +575,8 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                let fair = pricing::fair_value(btc_price, strike, vol, tte);
+                let raw_fair = pricing::fair_value(btc_price, strike, vol, tte);
+                let fair = pricing::exaggerate_fair(raw_fair, secs_left.max(0) as u64);
                 let fair_tick = (fair * 100.0).round() as i64;
 
                 // Clamp fair_tick to valid range (ticks 1-99)

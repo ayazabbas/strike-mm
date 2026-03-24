@@ -19,7 +19,7 @@ url = "https://app.strike.pm/api"
 poll_interval_secs = 1
 
 [quoting]
-spread_ticks = 6
+spread_ticks = 12
 lots_per_level = 25000
 num_levels = 2
 requote_cents = 10

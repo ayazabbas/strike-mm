@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Convert lots at a given tick to USDT value.
 /// On-chain LOT_SIZE = 1e16, so lots * LOT_SIZE / 1e18 = lots * 0.01.
@@ -140,28 +140,24 @@ impl RiskManager {
         self.positions.get(&market_id).cloned().unwrap_or_default()
     }
 
-    /// Check if placing on this market would breach the dollar budget.
-    /// `is_bid` = true for buying YES, false for selling YES.
-    /// `tick` is the tick at which the order would be placed.
-    /// `lots` is the unsigned lot count.
-    pub fn can_place(&self, market_id: u64, tick: u64, lots: u64, is_bid: bool) -> bool {
+    /// Return the maximum lots that fit within the remaining budget.
+    /// Instead of a boolean reject, this sizes down to what's affordable.
+    pub fn max_affordable_lots(&self, market_id: u64, tick: u64, lots: u64, is_bid: bool) -> u64 {
         let pos = self.positions.get(&market_id).cloned().unwrap_or_default();
-        let additional_cost = if is_bid {
-            lots_to_usdt(tick, lots)
-        } else {
-            (1.0 - tick as f64 / 100.0) * lots as f64 * 0.01
-        };
-        let new_max_loss = pos.total_max_loss + additional_cost;
-        if new_max_loss > self.max_loss_budget {
-            warn!(
-                market_id,
-                new_max_loss = format!("{:.2}", new_max_loss),
-                budget = format!("{:.2}", self.max_loss_budget),
-                "would breach dollar loss budget"
-            );
-            return false;
+        let remaining = pos.remaining_budget(self.max_loss_budget);
+        if remaining <= 0.0 {
+            return 0;
         }
-        true
+        let cost_per_lot = if is_bid {
+            tick as f64 / 100.0 * 0.01
+        } else {
+            (1.0 - tick as f64 / 100.0) * 0.01
+        };
+        if cost_per_lot <= 0.0 {
+            return lots;
+        }
+        let affordable = (remaining / cost_per_lot) as u64;
+        affordable.min(lots)
     }
 
     /// Remove market from tracking (e.g., after expiry).
@@ -367,18 +363,6 @@ mod tests {
     }
 
     #[test]
-    fn test_risk_manager_can_place() {
-        let mut rm = RiskManager::new(500.0, 6);
-        rm.record_fill(1, 50, 80000, true); // $400 max_loss
-
-        // $100 remaining — 25000 lots at tick 50 = $125 → over budget
-        assert!(!rm.can_place(1, 50, 25000, true));
-
-        // 10000 lots at tick 50 = $50 → ok
-        assert!(rm.can_place(1, 50, 10000, true));
-    }
-
-    #[test]
     fn test_inventory_skew_dollar_based() {
         let mut rm = RiskManager::new(500.0, 6);
 
@@ -419,5 +403,53 @@ mod tests {
         ps.record_fill(99, 100000, true);
         assert!((ps.total_max_loss - 990.0).abs() < 0.001);
         assert!((ps.total_max_gain - 10.0).abs() < 0.001);
+    }
+
+    // ── max_affordable_lots tests ─────────────────────────────────
+
+    #[test]
+    fn test_max_affordable_lots_full_budget() {
+        let rm = RiskManager::new(500.0, 6);
+        // Full budget, tick 50 bid: cost_per_lot = 0.005, affordable = 500/0.005 = 100000
+        // Capped at requested 25000
+        assert_eq!(rm.max_affordable_lots(1, 50, 25000, true), 25000);
+    }
+
+    #[test]
+    fn test_max_affordable_lots_partial_budget() {
+        let mut rm = RiskManager::new(500.0, 6);
+        rm.record_fill(1, 50, 80000, true); // $400 used, $100 remaining
+        // tick 50 bid: affordable = 100/0.005 = 20000
+        assert_eq!(rm.max_affordable_lots(1, 50, 25000, true), 20000);
+    }
+
+    #[test]
+    fn test_max_affordable_lots_exhausted() {
+        let mut rm = RiskManager::new(500.0, 6);
+        rm.record_fill(1, 50, 100000, true); // $500 used, $0 remaining
+        assert_eq!(rm.max_affordable_lots(1, 50, 25000, true), 0);
+    }
+
+    #[test]
+    fn test_max_affordable_lots_ask_side() {
+        let rm = RiskManager::new(500.0, 6);
+        // Ask at tick 50: cost_per_lot = (1 - 50/100) * 0.01 = 0.005
+        // affordable = 500/0.005 = 100000, capped at 25000
+        assert_eq!(rm.max_affordable_lots(1, 50, 25000, false), 25000);
+    }
+
+    #[test]
+    fn test_max_affordable_lots_cheap_tick() {
+        let rm = RiskManager::new(20.0, 6);
+        // Tick 5 bid: cost_per_lot = 0.0005, affordable = 20/0.0005 = 40000
+        // Capped at 25000
+        assert_eq!(rm.max_affordable_lots(1, 5, 25000, true), 25000);
+    }
+
+    #[test]
+    fn test_max_affordable_lots_expensive_tick() {
+        let rm = RiskManager::new(20.0, 6);
+        // Tick 95 bid: cost_per_lot = 0.0095, affordable = 20/0.0095 = 2105
+        assert_eq!(rm.max_affordable_lots(1, 95, 25000, true), 2105);
     }
 }

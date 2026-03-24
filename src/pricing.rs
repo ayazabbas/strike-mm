@@ -90,6 +90,43 @@ pub fn time_to_expiry_years(expiry_unix: i64) -> f64 {
     remaining_secs as f64 / (365.25 * 24.0 * 3600.0)
 }
 
+/// Exaggerate fair value to benefit the MM at extremes and near expiry.
+///
+/// A) Directional exaggeration: when fair is far from 0.5, push it further.
+/// B) Time decay exaggeration: near expiry (<45s), push harder.
+pub fn exaggerate_fair(fair: f64, secs_left: u64) -> f64 {
+    let mut adjusted = fair;
+
+    // A) Directional exaggeration — push extremes further
+    let dist = (fair - 0.5).abs();
+    if dist > 0.15 {
+        // Scale: at dist=0.15 → 0% extra, at dist=0.45 → 30% extra push (capped at 15 cents)
+        let extra = ((dist - 0.15) / 0.30).min(1.0) * 0.15;
+        if fair > 0.5 {
+            adjusted += extra;
+        } else {
+            adjusted -= extra;
+        }
+    }
+
+    // B) Time decay exaggeration — near expiry, push harder
+    if secs_left < 45 {
+        // Scale: at 45s → 0% extra, at 0s → 15% extra push
+        let time_factor = 1.0 - (secs_left as f64 / 45.0);
+        let time_extra = time_factor * 0.15;
+        let current_dist = (adjusted - 0.5).abs();
+        if current_dist > 0.05 {
+            if adjusted > 0.5 {
+                adjusted += time_extra;
+            } else {
+                adjusted -= time_extra;
+            }
+        }
+    }
+
+    adjusted.clamp(0.01, 0.99)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +240,73 @@ mod tests {
         // 80000.00000000 in Pyth format = 8_000_000_000_000
         let usd = pyth_price_to_f64(8_000_000_000_000);
         assert!((usd - 80_000.0).abs() < 0.01);
+    }
+
+    // ── exaggerate_fair tests ─────────────────────────────────────
+
+    #[test]
+    fn test_exaggerate_fair_no_change_near_center() {
+        // Fair near 0.5 with plenty of time — no exaggeration
+        let result = exaggerate_fair(0.50, 300);
+        assert!((result - 0.50).abs() < 0.001);
+
+        // Within the 0.15 dead zone
+        let result = exaggerate_fair(0.60, 300);
+        assert!((result - 0.60).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_exaggerate_fair_directional_high() {
+        // Fair = 0.85 (dist = 0.35), extra = ((0.35-0.15)/0.30).min(1.0) * 0.15 = 0.1
+        let result = exaggerate_fair(0.85, 300);
+        assert!(result > 0.85, "should push higher, got {result}");
+        assert!((result - 0.95).abs() < 0.01, "expected ~0.95, got {result}");
+    }
+
+    #[test]
+    fn test_exaggerate_fair_directional_low() {
+        // Fair = 0.15 (dist = 0.35), same magnitude push downward
+        let result = exaggerate_fair(0.15, 300);
+        assert!(result < 0.15, "should push lower, got {result}");
+        assert!((result - 0.05).abs() < 0.01, "expected ~0.05, got {result}");
+    }
+
+    #[test]
+    fn test_exaggerate_fair_time_decay() {
+        // Fair = 0.60 with 10s left — time factor = (1 - 10/45) ≈ 0.778, extra ≈ 0.117
+        // dist = 0.10 < 0.15, so no directional push; after no directional, adjusted=0.60
+        // current_dist = 0.10 > 0.05, so time push applies
+        let result = exaggerate_fair(0.60, 10);
+        assert!(result > 0.60, "should push higher near expiry, got {result}");
+
+        // No time push with plenty of time
+        let result_far = exaggerate_fair(0.60, 300);
+        assert!((result_far - 0.60).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_exaggerate_fair_combined() {
+        // Fair = 0.85, 0 secs left — both directional and time push
+        let result = exaggerate_fair(0.85, 0);
+        assert!(result > 0.95, "should push very high with both effects, got {result}");
+        assert!(result <= 0.99, "should clamp to 0.99");
+    }
+
+    #[test]
+    fn test_exaggerate_fair_clamp() {
+        // Extreme fair value clamped
+        let result = exaggerate_fair(0.99, 0);
+        assert!(result <= 0.99);
+        assert!(result >= 0.01);
+
+        let result = exaggerate_fair(0.01, 0);
+        assert!(result >= 0.01);
+    }
+
+    #[test]
+    fn test_exaggerate_fair_no_time_push_near_center() {
+        // Fair = 0.52, 5s left — current_dist = 0.02 < 0.05, no time push
+        let result = exaggerate_fair(0.52, 5);
+        assert!((result - 0.52).abs() < 0.001, "no push expected, got {result}");
     }
 }

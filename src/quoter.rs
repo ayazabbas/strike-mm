@@ -47,6 +47,8 @@ impl Quoter {
     }
 
     /// Build OrderParam structs for bid and ask levels.
+    /// Flattening orders (reducing existing position) are exempt from budget checks.
+    /// New-risk orders are sized down to what's affordable instead of being skipped.
     #[allow(clippy::too_many_arguments)]
     fn build_order_params(
         &self,
@@ -60,32 +62,53 @@ impl Quoter {
     ) -> (Vec<OrderParam>, Vec<OrderParam>) {
         let mut bid_params = Vec::new();
         let mut ask_params = Vec::new();
+        let net_lots = risk.position(market_id);
 
         if mode != QuoteMode::AsksOnly && bid_lots > 0 {
+            // A bid when net_lots < 0 is flattening (reducing short YES position)
+            let is_flattening = net_lots < 0;
             for level in 0..self.config.num_levels {
                 let tick = bid_tick.saturating_sub(level * 2);
                 if tick < 1 {
                     continue;
                 }
-                if !risk.can_place(market_id, tick, bid_lots, true) {
-                    warn!(market_id, tick, "risk limit — skipping bid");
-                    continue;
-                }
-                bid_params.push(OrderParam::bid(tick as u8, bid_lots));
+                let lots = if is_flattening {
+                    // Flattening: allow up to abs(position) lots, no budget check
+                    bid_lots.min(net_lots.unsigned_abs())
+                } else {
+                    // New risk: size down to affordable
+                    let affordable = risk.max_affordable_lots(market_id, tick, bid_lots, true);
+                    if affordable == 0 {
+                        warn!(market_id, tick, "risk limit — no affordable bid lots");
+                        continue;
+                    }
+                    affordable
+                };
+                bid_params.push(OrderParam::bid(tick as u8, lots));
             }
         }
 
         if mode != QuoteMode::BidsOnly && ask_lots > 0 {
+            // An ask when net_lots > 0 is flattening (reducing long YES position)
+            let is_flattening = net_lots > 0;
             for level in 0..self.config.num_levels {
                 let tick = ask_tick.saturating_add(level * 2);
                 if tick > 99 {
                     continue;
                 }
-                if !risk.can_place(market_id, tick, ask_lots, false) {
-                    warn!(market_id, tick, "risk limit — skipping ask");
-                    continue;
-                }
-                ask_params.push(OrderParam::ask(tick as u8, ask_lots));
+                let lots = if is_flattening {
+                    // Flattening: allow up to abs(position) lots, no budget check
+                    ask_lots.min(net_lots.unsigned_abs())
+                } else {
+                    // New risk: size down to affordable
+                    let affordable = risk.max_affordable_lots(market_id, tick, ask_lots, false);
+                    if affordable == 0 {
+                        warn!(market_id, tick, "risk limit — no affordable ask lots");
+                        continue;
+                    }
+                    affordable
+                };
+                ask_params.push(OrderParam::ask(tick as u8, lots));
             }
         }
 
