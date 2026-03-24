@@ -19,7 +19,7 @@ url = "https://app.strike.pm/api/mainnet"
 poll_interval_secs = 1
 
 [strategy]
-budget_per_market = 500.0
+budget_per_market = 20.0
 spread_ticks = 6
 lots_per_level = 25000
 levels_per_side = 2

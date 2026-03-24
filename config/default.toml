@@ -31,7 +31,7 @@ expiry_spread_multiplier_60s = 2.0
 min_quote_secs = 30
 
 [risk]
-max_loss_budget_usdt = 500.0
+max_loss_budget_usdt = 20.0
 max_skew_ticks = 6
 stale_data_timeout_secs = 10
 
