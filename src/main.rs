@@ -500,6 +500,7 @@ async fn main() -> Result<()> {
                         fill.filled_lots,
                         is_bid,
                     );
+                    quoter.record_fill();
                 }
             } else {
                 // Fallback: poll indexer for fill tracking
@@ -707,6 +708,7 @@ async fn main() -> Result<()> {
                         max_loss = format!("{:.2}", pos_state.total_max_loss),
                         remaining_budget = format!("{:.2}", pos_state.remaining_budget(max_loss_budget)),
                         price_age_ms,
+                        low_volume = quoter.is_low_volume(),
                         "REQUOTING"
                     );
                     quoter

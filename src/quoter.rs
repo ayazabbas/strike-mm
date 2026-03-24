@@ -27,6 +27,11 @@ pub struct MarketOrders {
     pub last_quote_time: Instant,
 }
 
+/// How much to multiply the requote cooldown when no fills for a while.
+const LOW_VOLUME_COOLDOWN_MULTIPLIER: u64 = 4;
+/// Duration without fills before entering low-volume mode (5 minutes).
+const LOW_VOLUME_THRESHOLD_SECS: u64 = 300;
+
 /// The Quoter manages order placement and cancellation via the SDK client.
 pub struct Quoter {
     client: StrikeClient,
@@ -34,6 +39,8 @@ pub struct Quoter {
     /// market_id → active orders
     pub active_orders: HashMap<u64, MarketOrders>,
     pub dry_run: bool,
+    /// Last time any order was filled. Used to reduce quote frequency during low volume.
+    last_fill_time: Instant,
 }
 
 impl Quoter {
@@ -43,7 +50,18 @@ impl Quoter {
             config,
             active_orders: HashMap::new(),
             dry_run,
+            last_fill_time: Instant::now(),
         }
+    }
+
+    /// Call when a fill is detected to reset the low-volume timer.
+    pub fn record_fill(&mut self) {
+        self.last_fill_time = Instant::now();
+    }
+
+    /// Whether we're in low-volume mode (no fills for 5+ minutes).
+    pub fn is_low_volume(&self) -> bool {
+        self.last_fill_time.elapsed().as_secs() >= LOW_VOLUME_THRESHOLD_SECS
     }
 
     /// Build OrderParam structs for bid and ask levels.
@@ -417,7 +435,14 @@ impl Quoter {
             None => return true,
         };
 
-        if orders.last_quote_time.elapsed().as_secs() < self.config.requote_cooldown_secs {
+        // In low-volume mode, multiply cooldown by 4x (75% fewer requotes)
+        let cooldown = if self.is_low_volume() {
+            self.config.requote_cooldown_secs * LOW_VOLUME_COOLDOWN_MULTIPLIER
+        } else {
+            self.config.requote_cooldown_secs
+        };
+
+        if orders.last_quote_time.elapsed().as_secs() < cooldown {
             return false;
         }
 
