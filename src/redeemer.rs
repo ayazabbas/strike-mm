@@ -1,10 +1,15 @@
+use alloy::primitives::U256;
 use eyre::Result;
 use std::collections::HashSet;
 use tracing::{info, warn};
 
 use strike_sdk::prelude::*;
 
+/// Max order IDs per cancelOrders TX to stay within gas limits.
+const CANCEL_BATCH_SIZE: usize = 50;
+
 /// Background task that redeems resolved market positions every 10 minutes.
+/// Also cancels any stuck open orders in resolved markets to unlock USDT.
 pub async fn run_redeem_loop(client: StrikeClient) {
     let mut redeemed: HashSet<u64> = HashSet::new();
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(600));
@@ -64,6 +69,68 @@ async fn redeem_cycle(client: &StrikeClient, redeemed: &mut HashSet<u64>) -> Res
             }
         }
     }
+
+    // Cancel stuck orders in resolved markets
+    let resolved_ids: HashSet<u64> = resolved.iter().map(|m| m.id as u64).collect();
+    if let Err(e) = cancel_stuck_orders(client, &owner, &resolved_ids).await {
+        warn!(err = %e, "redeemer: cancel stuck orders failed");
+    }
+
+    Ok(())
+}
+
+/// Cancel open orders that are stuck in resolved markets, unlocking locked USDT.
+async fn cancel_stuck_orders(
+    client: &StrikeClient,
+    owner: &alloy::primitives::Address,
+    resolved_market_ids: &HashSet<u64>,
+) -> Result<()> {
+    let address = format!("{owner:#x}");
+    let open_orders = client
+        .indexer()
+        .get_open_orders(&address)
+        .await
+        .map_err(|e| eyre::eyre!("indexer error: {e}"))?;
+
+    // Filter for open orders in resolved markets
+    let stuck_ids: Vec<U256> = open_orders
+        .iter()
+        .filter(|o| o.status == "open" && resolved_market_ids.contains(&(o.market_id as u64)))
+        .map(|o| U256::from(o.id as u64))
+        .collect();
+
+    if stuck_ids.is_empty() {
+        return Ok(());
+    }
+
+    info!(
+        count = stuck_ids.len(),
+        "redeemer: found stuck orders in resolved markets — cancelling"
+    );
+
+    for chunk in stuck_ids.chunks(CANCEL_BATCH_SIZE) {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.orders().cancel(chunk),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                info!(count = chunk.len(), "redeemer: batch cancel confirmed");
+            }
+            Ok(Err(e)) => {
+                warn!(count = chunk.len(), err = %e, "redeemer: batch cancel failed");
+            }
+            Err(_) => {
+                warn!(count = chunk.len(), "redeemer: batch cancel timed out");
+            }
+        }
+    }
+
+    info!(
+        total = stuck_ids.len(),
+        "redeemer: stuck order cancellation complete"
+    );
 
     Ok(())
 }
