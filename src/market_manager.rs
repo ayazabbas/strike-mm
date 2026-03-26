@@ -13,11 +13,13 @@ pub async fn fetch_active_markets(
     indexer_url: &str,
     min_expiry_secs: u64,
 ) -> Result<Vec<Market>> {
-    let url = format!("{indexer_url}/markets");
+    let url = format!("{indexer_url}/markets?status=active");
 
     #[derive(serde::Deserialize)]
     struct MarketsResponse {
-        markets: Vec<Market>,
+        // API v1 returns { data: [...], meta: {...} }
+        #[serde(alias = "markets")]
+        data: Vec<Market>,
     }
 
     let resp: MarketsResponse = client
@@ -35,7 +37,7 @@ pub async fn fetch_active_markets(
         .as_secs() as i64;
 
     let active: Vec<Market> = resp
-        .markets
+        .data
         .into_iter()
         .filter(|m| {
             m.status == "active"
