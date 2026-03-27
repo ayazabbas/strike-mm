@@ -605,14 +605,9 @@ async fn main() -> Result<()> {
                 let effective_lots =
                     ((cfg.quoting.lots_per_level as f64 * lots_scale).round() as u64).max(1);
 
-                // Improvement #1: One-sided quoting
-                let quote_mode = if fair > cfg.quoting.one_sided_threshold {
-                    quoter::QuoteMode::BidsOnly
-                } else if fair < (1.0 - cfg.quoting.one_sided_threshold) {
-                    quoter::QuoteMode::AsksOnly
-                } else {
-                    quoter::QuoteMode::TwoSided
-                };
+                // Always two-sided: extreme fair values clamp to tick 1 or 99
+                // instead of not quoting one side entirely
+                let quote_mode = quoter::QuoteMode::TwoSided;
 
                 let position = risk_mgr.position(market_id);
                 let pos_state = risk_mgr.position_state(market_id);
