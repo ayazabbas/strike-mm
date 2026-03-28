@@ -278,6 +278,15 @@ impl Quoter {
             }
         }
 
+        if placed.len() != all_params.len() {
+            warn!(
+                market_id,
+                expected = all_params.len(),
+                actual = placed.len(),
+                "placeOrders count mismatch — fewer placed than expected"
+            );
+        }
+
         info!(
             market_id,
             bids = bid_ids.len(),
@@ -548,10 +557,19 @@ impl Quoter {
             }
         }
 
+        if placed.len() != all_params.len() {
+            warn!(
+                market_id,
+                expected = all_params.len(),
+                actual = placed.len(),
+                "replaceOrders count mismatch — fewer placed than expected"
+            );
+        }
+
         info!(
             market_id,
             cancelled = cancel_count,
-            placed = place_count,
+            placed = placed.len(),
             bids = bid_ids.len(),
             asks = ask_ids.len(),
             "replaceOrders confirmed"

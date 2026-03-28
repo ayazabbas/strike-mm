@@ -606,6 +606,12 @@ async fn main() -> Result<()> {
                 let skew = risk_mgr.inventory_skew(market_id);
                 let (bid_tick, ask_tick) = pricing::compute_ticks(fair, effective_spread, skew);
 
+                // Clamp ticks so both levels stay in valid range [1,99].
+                // Level 0 = tick, Level 1 = tick±2, so bid needs ≥3 and ask needs ≤97
+                // to guarantee num_levels=2 always produces valid orders.
+                let bid_tick = bid_tick.max(3);
+                let ask_tick = ask_tick.min(97);
+
                 // Use same lot count for both sides — risk limits are enforced
                 // downstream in build_order_params via max_affordable_lots.
                 // This keeps displayed dollar sizes balanced instead of budget-aware
