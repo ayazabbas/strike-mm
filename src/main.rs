@@ -606,46 +606,12 @@ async fn main() -> Result<()> {
                 let skew = risk_mgr.inventory_skew(market_id);
                 let (bid_tick, ask_tick) = pricing::compute_ticks(fair, effective_spread, skew);
 
-                // Directional quote sizing: reduce size on same side, full on opposite
+                // Use same lot count for both sides — risk limits are enforced
+                // downstream in build_order_params via max_affordable_lots.
+                // This keeps displayed dollar sizes balanced instead of budget-aware
+                // pre-sizing that made the cheap side look tiny at extreme ticks.
                 let max_loss_budget = risk_mgr.max_loss_budget();
-                let (bid_lots, ask_lots) = {
-                    let base = effective_lots;
-                    let num_levels = cfg.quoting.num_levels;
-                    if pos_state.net_lots > 0 {
-                        // Long YES: reduce bids (same side), full asks (flattening)
-                        let bl = pos_state.quote_lots_same_side(
-                            bid_tick,
-                            base,
-                            num_levels,
-                            max_loss_budget,
-                        );
-                        (bl, base)
-                    } else if pos_state.net_lots < 0 {
-                        // Short YES: full bids (flattening), reduce asks (same side)
-                        let al = pos_state.quote_lots_same_side(
-                            100 - ask_tick,
-                            base,
-                            num_levels,
-                            max_loss_budget,
-                        );
-                        (base, al)
-                    } else {
-                        // Flat: both sides use budget-aware sizing
-                        let bl = pos_state.quote_lots_same_side(
-                            bid_tick,
-                            base,
-                            num_levels,
-                            max_loss_budget,
-                        );
-                        let al = pos_state.quote_lots_same_side(
-                            100 - ask_tick,
-                            base,
-                            num_levels,
-                            max_loss_budget,
-                        );
-                        (bl, al)
-                    }
-                };
+                let (bid_lots, ask_lots) = (effective_lots, effective_lots);
 
                 // Force requote when quote mode changes
                 let mode_changed = if let Some(orders) = quoter.active_orders.get(&market_id) {
