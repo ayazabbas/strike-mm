@@ -3954,7 +3954,7 @@ dependencies = [
 
 [[package]]
 name = "strike-sdk"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "alloy",
  "eyre",

@@ -68,6 +68,10 @@ impl Quoter {
     /// Flattening orders (reducing existing position) are exempt from budget checks.
     /// New-risk orders are sized down to what's affordable instead of being skipped.
     #[allow(clippy::too_many_arguments)]
+    /// Build OrderParam structs for bid and ask levels.
+    /// Returns (all_params, bid_count) — bid_count indicates how many of the
+    /// leading params are bids (rest are asks). This is used to correctly
+    /// assign sides when the SDK can't determine side from resting events.
     fn build_order_params(
         &self,
         bid_tick: u64,
@@ -219,6 +223,7 @@ impl Quoter {
         let (bid_params, ask_params) = self.build_order_params(
             bid_tick, ask_tick, risk, market_id, mode, bid_lots, ask_lots,
         );
+        let bid_param_count = bid_params.len();
         let all_params: Vec<OrderParam> = bid_params.into_iter().chain(ask_params).collect();
 
         if all_params.is_empty() {
@@ -268,10 +273,13 @@ impl Quoter {
             }
         };
 
+        // Assign sides from params (not from SDK response — resting orders
+        // emit OrderResting without side info, so SDK defaults to Bid).
+        // Params are always [bids..., asks...], and contract assigns IDs in order.
         let mut bid_ids = Vec::new();
         let mut ask_ids = Vec::new();
-        for p in &placed {
-            if p.side == Side::Bid {
+        for (i, p) in placed.iter().enumerate() {
+            if i < bid_param_count {
                 bid_ids.push(p.order_id);
             } else {
                 ask_ids.push(p.order_id);
@@ -493,6 +501,7 @@ impl Quoter {
         let (bid_params, ask_params) = self.build_order_params(
             bid_tick, ask_tick, risk, market_id, mode, bid_lots, ask_lots,
         );
+        let bid_param_count = bid_params.len();
         let all_params: Vec<OrderParam> = bid_params.into_iter().chain(ask_params).collect();
 
         if self.dry_run {
@@ -547,10 +556,11 @@ impl Quoter {
             }
         };
 
+        // Assign sides from params (not SDK response — resting orders lack side info)
         let mut bid_ids = Vec::new();
         let mut ask_ids = Vec::new();
-        for p in &placed {
-            if p.side == Side::Bid {
+        for (i, p) in placed.iter().enumerate() {
+            if i < bid_param_count {
                 bid_ids.push(p.order_id);
             } else {
                 ask_ids.push(p.order_id);
