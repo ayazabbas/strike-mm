@@ -94,13 +94,10 @@ impl Quoter {
                     // Flattening: allow up to abs(position) lots, no budget check
                     bid_lots.min(net_lots.unsigned_abs())
                 } else {
-                    // New risk: size down to affordable
-                    let affordable = risk.max_affordable_lots(market_id, tick, bid_lots, true);
-                    if affordable == 0 {
-                        warn!(market_id, tick, "risk limit — no affordable bid lots");
-                        continue;
-                    }
-                    affordable
+                    // New risk: cap to affordable, minimum 1 lot to ensure order always places.
+                    // Never skip — skipping causes orphaned orders when the quoter loses
+                    // track of which orders are live on-chain.
+                    risk.max_affordable_lots(market_id, tick, bid_lots, true).max(1)
                 };
                 bid_params.push(OrderParam::bid(tick as u8, lots));
             }
@@ -118,13 +115,8 @@ impl Quoter {
                     // Flattening: allow up to abs(position) lots, no budget check
                     ask_lots.min(net_lots.unsigned_abs())
                 } else {
-                    // New risk: size down to affordable
-                    let affordable = risk.max_affordable_lots(market_id, tick, ask_lots, false);
-                    if affordable == 0 {
-                        warn!(market_id, tick, "risk limit — no affordable ask lots");
-                        continue;
-                    }
-                    affordable
+                    // New risk: cap to affordable, minimum 1 lot (same rationale as bids)
+                    risk.max_affordable_lots(market_id, tick, ask_lots, false).max(1)
                 };
                 ask_params.push(OrderParam::ask(tick as u8, lots));
             }

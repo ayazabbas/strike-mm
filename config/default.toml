@@ -7,15 +7,15 @@ chain_id = 97
 private_key_env = "MM_PRIVATE_KEY"
 
 [contracts]
-order_book = "0x343d3f42562A8E5C794DFf8637664D2d03246FB9"
-vault = "0x10909d11446e48551DA0366f59b9Ac9Cb9079314"
+order_book = "0x48C5ccBb3034E8bB76D96974c66a900B1CdAEcE7"
+vault = "0xaa8b16F64e2dC9958F0dBe97D5f274571a80497a"
 usdt = "0xb242dc031998b06772C63596Bfce091c80D4c3fA"
-redemption = "0x03961AcDb718D84079De1B0236a77A7a1A3df177"
-batch_auction = "0xF6233287fb878706B191b868a5e38E1DfdfAdDf7"
-market_factory = "0xd2783195A8d4Ee2f99616c3b9048B43187951E67"
+redemption = "0xd3CcF8f19574F1Baf1117314Fd5131bC8B7059D1"
+batch_auction = "0xEf0F96D0854C15265e40Dc5e7aD44a8D7405e51d"
+market_factory = "0xED39F523B9cD6D915ab76B17029A20A4132Cb952"
 
 [indexer]
-url = "https://app.strike.pm/api"
+url = "http://localhost:8181"
 poll_interval_secs = 1
 
 [quoting]
