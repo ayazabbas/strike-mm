@@ -594,16 +594,8 @@ async fn main() -> Result<()> {
                 let effective_spread =
                     ((cfg.quoting.spread_ticks as f64 * spread_multiplier).round() as u64).max(2);
 
-                // Improvement #4: Size reduction near expiry
-                let lots_scale = if secs_left <= 60 {
-                    0.25
-                } else if secs_left <= 120 {
-                    0.50
-                } else {
-                    1.0
-                };
-                let effective_lots =
-                    ((cfg.quoting.lots_per_level as f64 * lots_scale).round() as u64).max(1);
+                // Size stays constant regardless of time-to-expiry
+                let effective_lots = cfg.quoting.lots_per_level;
 
                 // Always two-sided: extreme fair values clamp to tick 1 or 99
                 // instead of not quoting one side entirely
